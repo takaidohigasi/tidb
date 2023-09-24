@@ -49,6 +49,7 @@ const (
 	s3ProviderOption     = "s3.provider"
 	s3RoleARNOption      = "s3.role-arn"
 	s3ExternalIDOption   = "s3.external-id"
+	s3ProfileOption      = "s3.profile"
 	notFound             = "NotFound"
 	// number of retries to make of operations.
 	maxRetries = 7
@@ -152,6 +153,7 @@ type S3BackendOptions struct {
 	RoleARN               string `json:"role-arn" toml:"role-arn"`
 	ExternalID            string `json:"external-id" toml:"external-id"`
 	ObjectLockEnabled     bool   `json:"object-lock-enabled" toml:"object-lock-enabled"`
+	Profile               string `json:"profile" toml:"profile"`
 }
 
 // Apply apply s3 options on backuppb.S3.
@@ -195,6 +197,7 @@ func (options *S3BackendOptions) Apply(s3 *backuppb.S3) error {
 	s3.RoleArn = options.RoleARN
 	s3.ExternalId = options.ExternalID
 	s3.Provider = options.Provider
+	s3.Profile = options.Profile
 	return nil
 }
 
@@ -212,6 +215,7 @@ func defineS3Flags(flags *pflag.FlagSet) {
 	flags.String(s3ProviderOption, "", "(experimental) Set the S3 provider, e.g. aws, alibaba, ceph")
 	flags.String(s3RoleARNOption, "", "(experimental) Set the ARN of the IAM role to assume when accessing AWS S3")
 	flags.String(s3ExternalIDOption, "", "(experimental) Set the external ID when assuming the role to access AWS S3")
+	flags.String(s3ProfileOption, "", "Set the profile name to access AWS S3")
 }
 
 // parseFromFlags parse S3BackendOptions from command line flags.
@@ -252,6 +256,10 @@ func (options *S3BackendOptions) parseFromFlags(flags *pflag.FlagSet) error {
 		return errors.Trace(err)
 	}
 	options.ExternalID, err = flags.GetString(s3ExternalIDOption)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	options.Profile, err = flags.GetString(s3ProfileOption)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -327,7 +335,8 @@ func NewS3Storage(ctx context.Context, backend *backuppb.S3, opts *ExternalStora
 	}
 	// awsConfig.WithLogLevel(aws.LogDebugWithSigning)
 	awsSessionOpts := session.Options{
-		Config: *awsConfig,
+		Config:  *awsConfig,
+		Profile: qs.Profile,
 	}
 	ses, err := session.NewSessionWithOptions(awsSessionOpts)
 	if err != nil {
