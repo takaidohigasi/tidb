@@ -412,6 +412,19 @@ func TestS3Storage(t *testing.T) {
 			errReturn:      false,
 			sendCredential: false,
 		},
+		{
+			name: "profile option",
+			s3: &backuppb.S3{
+				Region:         "us-west-2",
+				Endpoint:       s.URL,
+				Bucket:         "bucket",
+				Prefix:         "prefix",
+				ForcePathStyle: true,
+				Profile:        "default",
+			},
+			errReturn:      false,
+			sendCredential: true,
+		},
 	}
 	for i := range tests {
 		testFn(&tests[i], t)
