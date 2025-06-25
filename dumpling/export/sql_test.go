@@ -1759,7 +1759,7 @@ func TestPickupPossibleField(t *testing.T) {
 		}, // several unique keys and ordinary keys, use key who has max cardinality
 		{
 			nil,
-			"int2",
+			"string1",
 			false,
 			[][]driver.Value{
 				{table, 0, "PRIMARY", 1, "string1", "A", 2, nil, nil, "", "BTREE", "", ""},
