@@ -955,24 +955,65 @@ func (d *Dumper) concurrentDumpTableByString(tctx *tcontext.Context, conn *BaseC
 		estimatedChunks = 1
 	}
 
-	// Get sample values to split ranges
-	sampleQuery := fmt.Sprintf("SELECT `%s` FROM `%s`.`%s`", escapeString(field), escapeString(db), escapeString(tbl))
-	if conf.Where != "" {
-		sampleQuery = fmt.Sprintf("%s WHERE %s", sampleQuery, conf.Where)
-	}
-	sampleQuery = fmt.Sprintf("%s ORDER BY `%s` LIMIT %d", sampleQuery, escapeString(field), estimatedChunks+1)
-
+	// Get distributed sample values across the dataset for better chunking
 	var sampleValues []string
-	err := conn.QuerySQL(tctx, func(rows *sql.Rows) error {
-		var val sql.NullString
-		err := rows.Scan(&val)
-		if err == nil && val.Valid {
-			sampleValues = append(sampleValues, val.String)
+	var err error
+
+	// Use ROW_NUMBER() based sampling for better distribution
+	if estimatedChunks > 1 {
+		// Calculate intervals to get evenly distributed samples
+		interval := count / estimatedChunks
+		if interval < 1 {
+			interval = 1
 		}
-		return err
-	}, func() {
-		sampleValues = sampleValues[:0]
-	}, sampleQuery)
+
+		// Sample using ROW_NUMBER() to get distributed values
+		sampleQuery := fmt.Sprintf(
+			"SELECT `%s` FROM (SELECT `%s`, ROW_NUMBER() OVER (ORDER BY `%s`) as rn FROM `%s`.`%s`",
+			escapeString(field), escapeString(field), escapeString(field), escapeString(db), escapeString(tbl))
+		if conf.Where != "" {
+			sampleQuery = fmt.Sprintf("%s WHERE %s", sampleQuery, conf.Where)
+		}
+		sampleQuery = fmt.Sprintf("%s) t WHERE MOD(rn, %d) = 0 ORDER BY `%s` LIMIT %d",
+			sampleQuery, interval, escapeString(field), estimatedChunks+1)
+
+		err = conn.QuerySQL(tctx, func(rows *sql.Rows) error {
+			var val sql.NullString
+			err := rows.Scan(&val)
+			if err == nil && val.Valid {
+				sampleValues = append(sampleValues, val.String)
+			}
+			return err
+		}, func() {
+			sampleValues = sampleValues[:0]
+		}, sampleQuery)
+
+		// Fallback to simpler sampling if ROW_NUMBER() approach fails
+		if err != nil {
+			tctx.L().Info("ROW_NUMBER sampling failed, trying simpler approach", log.ShortError(err))
+			// Use modulo-based sampling as fallback
+			simpleSampleQuery := fmt.Sprintf("SELECT `%s` FROM `%s`.`%s`", escapeString(field), escapeString(db), escapeString(tbl))
+			whereClause := fmt.Sprintf("MOD(CRC32(`%s`), %d) = 0", escapeString(field), int(interval))
+			if conf.Where != "" {
+				simpleSampleQuery = fmt.Sprintf("%s WHERE %s AND %s", simpleSampleQuery, conf.Where, whereClause)
+			} else {
+				simpleSampleQuery = fmt.Sprintf("%s WHERE %s", simpleSampleQuery, whereClause)
+			}
+			simpleSampleQuery = fmt.Sprintf("%s ORDER BY `%s` LIMIT %d",
+				simpleSampleQuery, escapeString(field), estimatedChunks+1)
+
+			err = conn.QuerySQL(tctx, func(rows *sql.Rows) error {
+				var val sql.NullString
+				err := rows.Scan(&val)
+				if err == nil && val.Valid {
+					sampleValues = append(sampleValues, val.String)
+				}
+				return err
+			}, func() {
+				sampleValues = sampleValues[:0]
+			}, simpleSampleQuery)
+		}
+	}
 
 	if err != nil {
 		tctx.L().Info("fallback to sequential dump due to sampling error", log.ShortError(err))
@@ -984,12 +1025,25 @@ func (d *Dumper) concurrentDumpTableByString(tctx *tcontext.Context, conn *BaseC
 	}
 
 	if len(sampleValues) <= 1 {
+		tctx.L().Info("insufficient sample values for chunking, falling back to sequential dump",
+			zap.String("database", db),
+			zap.String("table", tbl),
+			zap.String("field", field),
+			zap.Int("sampleCount", len(sampleValues)))
 		orderByClause, err := buildOrderByClause(tctx, conf, conn, db, tbl, meta.HasImplicitRowID())
 		if err != nil {
 			return err
 		}
 		return d.dumpWholeTableDirectly(tctx, meta, taskChan, "", orderByClause, 0, 1)
 	}
+
+	tctx.L().Info("using string-based chunking with sample values",
+		zap.String("database", db),
+		zap.String("table", tbl),
+		zap.String("field", field),
+		zap.Int("sampleCount", len(sampleValues)),
+		zap.Uint64("estimatedRows", count),
+		zap.Uint64("targetRowsPerChunk", conf.Rows))
 
 	selectField, selectLen := meta.SelectedField(), meta.SelectedLen()
 	orderByClause := fmt.Sprintf("ORDER BY `%s`", escapeString(field))
@@ -1006,6 +1060,12 @@ func (d *Dumper) concurrentDumpTableByString(tctx *tcontext.Context, conn *BaseC
 		escapedValue := strings.ReplaceAll(sampleValues[0], "'", "''")
 		where := fmt.Sprintf("%s`%s` < '%s'", nullValueCondition, escapeString(field), escapedValue)
 		query := buildSelectQuery(db, tbl, selectField, "", buildWhereCondition(conf, where), orderByClause)
+		tctx.L().Debug("created string chunk",
+			zap.String("database", db),
+			zap.String("table", tbl),
+			zap.Int("chunkIndex", chunkIndex),
+			zap.Int("totalChunks", totalChunks),
+			zap.String("condition", where))
 		task := d.newTaskTableData(meta, newTableData(query, selectLen, false), chunkIndex, totalChunks)
 		ctxDone := d.sendTaskToChan(tctx, task, taskChan)
 		if ctxDone {
@@ -1023,6 +1083,12 @@ func (d *Dumper) concurrentDumpTableByString(tctx *tcontext.Context, conn *BaseC
 			escapeString(field), escapedValue1,
 			escapeString(field), escapedValue2)
 		query := buildSelectQuery(db, tbl, selectField, "", buildWhereCondition(conf, where), orderByClause)
+		tctx.L().Debug("created string chunk",
+			zap.String("database", db),
+			zap.String("table", tbl),
+			zap.Int("chunkIndex", chunkIndex),
+			zap.Int("totalChunks", totalChunks),
+			zap.String("condition", where))
 		task := d.newTaskTableData(meta, newTableData(query, selectLen, false), chunkIndex, totalChunks)
 		ctxDone := d.sendTaskToChan(tctx, task, taskChan)
 		if ctxDone {
@@ -1036,6 +1102,12 @@ func (d *Dumper) concurrentDumpTableByString(tctx *tcontext.Context, conn *BaseC
 		escapedValue := strings.ReplaceAll(sampleValues[len(sampleValues)-1], "'", "''")
 		where := fmt.Sprintf("`%s` >= '%s'", escapeString(field), escapedValue)
 		query := buildSelectQuery(db, tbl, selectField, "", buildWhereCondition(conf, where), orderByClause)
+		tctx.L().Debug("created string chunk",
+			zap.String("database", db),
+			zap.String("table", tbl),
+			zap.Int("chunkIndex", chunkIndex),
+			zap.Int("totalChunks", totalChunks),
+			zap.String("condition", where))
 		task := d.newTaskTableData(meta, newTableData(query, selectLen, false), chunkIndex, totalChunks)
 		ctxDone := d.sendTaskToChan(tctx, task, taskChan)
 		if ctxDone {
