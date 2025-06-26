@@ -3,7 +3,6 @@
 package export
 
 import (
-	"fmt"
 	"testing"
 	"time"
 
@@ -147,110 +146,6 @@ func TestIsLikelyAutoIncrement(t *testing.T) {
 	}
 }
 
-func TestGetMinimalBoundaries(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	require.NoError(t, err)
-	defer db.Close()
-
-	// Mock the min/max union query
-	rows := sqlmock.NewRows([]string{"field"}).
-		AddRow("aaa").
-		AddRow("zzz")
-	mock.ExpectQuery("\\(SELECT .* LIMIT 1\\) UNION ALL \\(SELECT .* DESC LIMIT 1\\)").
-		WillReturnRows(rows)
-
-	tctx := tcontext.Background()
-	conn, err := db.Conn(tctx)
-	require.NoError(t, err)
-	baseConn := newBaseConn(conn, false, nil)
-
-	conf := DefaultConfig()
-	chunker := NewAdaptiveChunker("test_db", "test_table", "name", conf, baseConn)
-	chunker.SetStrategy(StrategyMinimal)
-
-	boundaries := chunker.getMinimalBoundaries(tctx, 5)
-	require.Len(t, boundaries, 2)
-	require.Equal(t, "aaa", boundaries[0])
-	require.Equal(t, "zzz", boundaries[1])
-}
-
-func TestGetOptimisticBoundaries(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	require.NoError(t, err)
-	defer db.Close()
-
-	// Mock the MIN/MAX query
-	rows := sqlmock.NewRows([]string{"MIN", "MAX"}).
-		AddRow("1", "1000")
-	mock.ExpectQuery("SELECT MIN\\(.+\\), MAX\\(.+\\)").WillReturnRows(rows)
-
-	tctx := tcontext.Background()
-	conn, err := db.Conn(tctx)
-	require.NoError(t, err)
-	baseConn := newBaseConn(conn, false, nil)
-
-	conf := DefaultConfig()
-	chunker := NewAdaptiveChunker("test_db", "test_table", "id", conf, baseConn)
-
-	boundaries := chunker.getOptimisticBoundaries(tctx, 1000, 10)
-	require.Len(t, boundaries, 2)
-	require.Equal(t, "1", boundaries[0])
-	require.Equal(t, "1000", boundaries[1])
-}
-
-func TestTryRowNumberSampling(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	require.NoError(t, err)
-	defer db.Close()
-
-	// Mock the ROW_NUMBER() query
-	rows := sqlmock.NewRows([]string{"field"}).
-		AddRow("sample1").
-		AddRow("sample2").
-		AddRow("sample3")
-	mock.ExpectQuery("SELECT .* FROM \\(SELECT .* ROW_NUMBER\\(\\)").WillReturnRows(rows)
-
-	tctx := tcontext.Background()
-	conn, err := db.Conn(tctx)
-	require.NoError(t, err)
-	baseConn := newBaseConn(conn, false, nil)
-
-	conf := DefaultConfig()
-	chunker := NewAdaptiveChunker("test_db", "test_table", "name", conf, baseConn)
-
-	boundaries := chunker.tryRowNumberSampling(tctx, 100, 5)
-	require.Len(t, boundaries, 3)
-	require.Equal(t, "sample1", boundaries[0])
-	require.Equal(t, "sample2", boundaries[1])
-	require.Equal(t, "sample3", boundaries[2])
-}
-
-func TestGetOffsetBasedBoundaries(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	require.NoError(t, err)
-	defer db.Close()
-
-	// Mock multiple LIMIT OFFSET queries
-	for i := 0; i < 3; i++ {
-		rows := sqlmock.NewRows([]string{"field"}).
-			AddRow(fmt.Sprintf("boundary_%d", i))
-		mock.ExpectQuery("SELECT .* ORDER BY .* LIMIT \\d+, 1").WillReturnRows(rows)
-	}
-
-	tctx := tcontext.Background()
-	conn, err := db.Conn(tctx)
-	require.NoError(t, err)
-	baseConn := newBaseConn(conn, false, nil)
-
-	conf := DefaultConfig()
-	chunker := NewAdaptiveChunker("test_db", "test_table", "name", conf, baseConn)
-
-	boundaries := chunker.getOffsetBasedBoundaries(tctx, 1000, 3)
-	require.Len(t, boundaries, 3)
-	require.Equal(t, "boundary_0", boundaries[0])
-	require.Equal(t, "boundary_1", boundaries[1])
-	require.Equal(t, "boundary_2", boundaries[2])
-}
 
 func TestRecordChunkMetrics(t *testing.T) {
 	conf := DefaultConfig()
@@ -349,44 +244,45 @@ func TestAdaptChunkSize(t *testing.T) {
 	}
 }
 
-func TestGetSampleBoundaries(t *testing.T) {
+func TestIncrementalBoundaryDiscovery(t *testing.T) {
 	tests := []struct {
 		name         string
 		strategy     ChunkStrategy
 		setupMocks   func(sqlmock.Sqlmock)
-		expectedLen  int
 	}{
 		{
 			name:     "minimal strategy",
 			strategy: StrategyMinimal,
 			setupMocks: func(mock sqlmock.Sqlmock) {
-				rows := sqlmock.NewRows([]string{"field"}).
-					AddRow("min_val").
-					AddRow("max_val")
-				mock.ExpectQuery("\\(SELECT .* LIMIT 1\\) UNION ALL").WillReturnRows(rows)
+				// Initial boundary query
+				mock.ExpectQuery("SELECT .* ORDER BY .* LIMIT 1").WillReturnRows(
+					sqlmock.NewRows([]string{"field"}).AddRow("start_val"))
+				// Next boundary query
+				mock.ExpectQuery("SELECT .* WHERE .* > .* ORDER BY .* LIMIT").WillReturnRows(
+					sqlmock.NewRows([]string{"field"}).AddRow("next_val"))
 			},
-			expectedLen: 2,
 		},
 		{
 			name:     "optimistic strategy",
 			strategy: StrategyOptimistic,
 			setupMocks: func(mock sqlmock.Sqlmock) {
-				rows := sqlmock.NewRows([]string{"MIN", "MAX"}).
-					AddRow("1", "1000")
-				mock.ExpectQuery("SELECT MIN\\(.+\\), MAX\\(.+\\)").WillReturnRows(rows)
+				// Initial boundary query
+				mock.ExpectQuery("SELECT .* ORDER BY .* LIMIT 1").WillReturnRows(
+					sqlmock.NewRows([]string{"field"}).AddRow("1"))
+				// No additional query needed for numeric optimistic
 			},
-			expectedLen: 2,
 		},
 		{
-			name:     "composite strategy with ROW_NUMBER",
+			name:     "composite strategy",
 			strategy: StrategyComposite,
 			setupMocks: func(mock sqlmock.Sqlmock) {
-				rows := sqlmock.NewRows([]string{"field"}).
-					AddRow("sample1").
-					AddRow("sample2")
-				mock.ExpectQuery("SELECT .* FROM \\(SELECT .* ROW_NUMBER\\(\\)").WillReturnRows(rows)
+				// Initial boundary query
+				mock.ExpectQuery("SELECT .* ORDER BY .* LIMIT 1").WillReturnRows(
+					sqlmock.NewRows([]string{"field"}).AddRow("sample1"))
+				// Next boundary query
+				mock.ExpectQuery("SELECT .* WHERE .* > .* ORDER BY .* LIMIT").WillReturnRows(
+					sqlmock.NewRows([]string{"field"}).AddRow("sample2"))
 			},
-			expectedLen: 2,
 		},
 	}
 
@@ -407,9 +303,21 @@ func TestGetSampleBoundaries(t *testing.T) {
 			chunker := NewAdaptiveChunker("test_db", "test_table", "field", conf, baseConn)
 			chunker.SetStrategy(tt.strategy)
 
-			boundaries, err := chunker.GetSampleBoundaries(tctx, 1000, 5)
+			// Test incremental boundary discovery approach
+			initialBoundary, err := chunker.GetInitialBoundary(tctx)
 			require.NoError(t, err)
-			require.Len(t, boundaries, tt.expectedLen)
+			require.NotEmpty(t, initialBoundary)
+			
+			// Test getting next boundary
+			nextBoundary, err := chunker.GetNextChunkBoundary(tctx, initialBoundary)
+			if tt.strategy == StrategyOptimistic && isNumeric(initialBoundary) {
+				// Optimistic with numeric should calculate next boundary
+				require.NoError(t, err)
+				require.NotEmpty(t, nextBoundary)
+			} else {
+				// Other strategies query the database
+				require.NoError(t, err)
+			}
 		})
 	}
 }
@@ -460,16 +368,18 @@ func TestChunkMetricsTracking(t *testing.T) {
 	require.Equal(t, time.Duration(14*100)*time.Millisecond, chunker.metrics[9].ProcessingTime)
 }
 
-func TestCachingBehavior(t *testing.T) {
+func TestPrefetchingQueries(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
 	defer db.Close()
 
-	// Mock for first call
-	rows1 := sqlmock.NewRows([]string{"field"}).
-		AddRow("boundary1").
-		AddRow("boundary2")
-	mock.ExpectQuery("\\(SELECT .* LIMIT 1\\) UNION ALL").WillReturnRows(rows1)
+	// Mock initial boundary
+	mock.ExpectQuery("SELECT .* ORDER BY .* LIMIT 1").WillReturnRows(
+		sqlmock.NewRows([]string{"field"}).AddRow("start"))
+	
+	// Mock next boundary query
+	mock.ExpectQuery("SELECT .* WHERE .* > .* ORDER BY .* LIMIT").WillReturnRows(
+		sqlmock.NewRows([]string{"field"}).AddRow("middle"))
 
 	tctx := tcontext.Background()
 	conn, err := db.Conn(tctx)
@@ -478,19 +388,15 @@ func TestCachingBehavior(t *testing.T) {
 
 	conf := DefaultConfig()
 	chunker := NewAdaptiveChunker("test_db", "test_table", "field", conf, baseConn)
-	chunker.SetStrategy(StrategyMinimal)
+	chunker.SetStrategy(StrategyComposite)
 
-	// First call should hit the database
-	boundaries1, err := chunker.GetSampleBoundaries(tctx, 1000, 5)
+	// Test incremental boundary discovery using prefetching queries
+	initialBoundary, err := chunker.GetInitialBoundary(tctx)
 	require.NoError(t, err)
-	require.Len(t, boundaries1, 2)
+	require.Equal(t, "start", initialBoundary)
 
-	// Second call should use cache (no additional mock expectations)
-	boundaries2, err := chunker.GetSampleBoundaries(tctx, 1000, 5)
+	// Get next boundary using prefetching
+	nextBoundary, err := chunker.GetNextChunkBoundary(tctx, initialBoundary)
 	require.NoError(t, err)
-	require.Equal(t, boundaries1, boundaries2)
-
-	// Verify cache is working
-	require.True(t, chunker.sampleCacheValid)
-	require.Equal(t, boundaries1, chunker.sampledBoundaries)
+	require.Equal(t, "middle", nextBoundary)
 }

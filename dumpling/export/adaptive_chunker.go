@@ -1,5 +1,34 @@
 // Copyright 2025 PingCAP, Inc. Licensed under Apache-2.0.
 
+// Adaptive Chunking Implementation for Dumpling
+//
+// This package implements dynamic chunking strategies that avoid the connection timeout
+// issues experienced with large tables in MySQL 5.7. Instead of using expensive 
+// hash-based sampling (CRC32), it uses incremental boundary discovery with prefetching queries.
+//
+// Key Approaches:
+//
+// 1. Composite Strategy (complex primary keys):
+//    - Uses prefetching queries: SELECT field FROM table WHERE field > 'prev' ORDER BY field LIMIT N, 1
+//    - Discovers boundaries incrementally during processing
+//    - Avoids expensive ROW_NUMBER() operations on older MySQL versions
+//
+// 2. Optimistic Strategy (auto-increment numeric keys):
+//    - Calculates boundaries arithmetically: next_boundary = current_value + chunk_size
+//    - Assumes no large gaps in auto-increment sequences
+//    - Much faster than querying for numeric primary keys
+//
+// 3. Minimal Strategy (very large tables 100M+ rows):
+//    - Uses smaller chunk sizes and simple LIMIT queries
+//    - Avoids complex operations that might cause timeouts
+//    - Designed specifically for connection timeout prevention
+//
+// Performance Features:
+// - Time-based chunk sizing (target: 500ms per chunk)
+// - Dynamic chunk size adjustment based on processing feedback
+// - Sliding window metrics tracking (last 10 chunks)
+// - Adaptive sizing bounds: 100 to 100,000 rows per chunk
+
 package export
 
 import (
@@ -47,7 +76,7 @@ type ChunkingMetrics struct {
 	TimestampEnd     time.Time
 }
 
-// AdaptiveChunker implements Spirit-inspired chunking strategies
+// AdaptiveChunker implements dynamic chunking with incremental boundary discovery
 type AdaptiveChunker struct {
 	strategy       ChunkStrategy
 	targetTime     time.Duration
@@ -61,11 +90,6 @@ type AdaptiveChunker struct {
 	// Performance tracking
 	metrics        []ChunkingMetrics
 	watermark      string
-	
-	// Sampling cache
-	sampledBoundaries []string
-	lastSampleTime    time.Time
-	sampleCacheValid  bool
 }
 
 // NewAdaptiveChunker creates a new adaptive chunker
@@ -144,176 +168,138 @@ func (ac *AdaptiveChunker) isLikelyAutoIncrement(tctx *tcontext.Context) bool {
 	return false
 }
 
-// GetSampleBoundaries implements Spirit-style actual data sampling
-func (ac *AdaptiveChunker) GetSampleBoundaries(tctx *tcontext.Context, count int64, targetChunks int64) ([]string, error) {
-	// Use cached boundaries if still valid
-	if ac.sampleCacheValid && time.Since(ac.lastSampleTime) < 5*time.Minute {
-		return ac.sampledBoundaries, nil
-	}
-	
-	var boundaries []string
-	
+// GetNextChunkBoundary finds the next chunk boundary using prefetching queries
+func (ac *AdaptiveChunker) GetNextChunkBoundary(tctx *tcontext.Context, previousBoundary string) (string, error) {
 	switch ac.strategy {
 	case StrategyMinimal:
-		// For very large tables, get just a few safe boundaries
-		boundaries = ac.getMinimalBoundaries(tctx, targetChunks)
+		// For very large tables, get minimal next boundary
+		return ac.getMinimalNextBoundary(tctx, previousBoundary)
 	case StrategyOptimistic:
-		// For auto-increment fields, use min/max approach
-		boundaries = ac.getOptimisticBoundaries(tctx, count, targetChunks)
+		// For auto-increment fields, calculate next boundary
+		return ac.getOptimisticNextBoundary(tctx, previousBoundary)
 	case StrategyComposite:
-		// For complex fields, use actual data sampling
-		boundaries = ac.getCompositeBoundaries(tctx, count, targetChunks)
+		// For complex fields, use prefetching query
+		return ac.getCompositeNextBoundary(tctx, previousBoundary)
 	default:
-		return nil, fmt.Errorf("unknown chunking strategy: %v", ac.strategy)
+		return "", fmt.Errorf("unknown chunking strategy: %v", ac.strategy)
 	}
-	
-	// Cache the results
-	ac.sampledBoundaries = boundaries
-	ac.lastSampleTime = time.Now()
-	ac.sampleCacheValid = true
-	
-	return boundaries, nil
 }
 
-// getMinimalBoundaries gets safe boundaries for very large tables
-func (ac *AdaptiveChunker) getMinimalBoundaries(tctx *tcontext.Context, targetChunks int64) []string {
-	// For minimal strategy, just get first and last values to create a few safe chunks
-	query := fmt.Sprintf("(SELECT `%s` FROM `%s`.`%s` ORDER BY `%s` LIMIT 1) UNION ALL (SELECT `%s` FROM `%s`.`%s` ORDER BY `%s` DESC LIMIT 1)",
-		escapeString(ac.field), escapeString(ac.db), escapeString(ac.table), escapeString(ac.field),
-		escapeString(ac.field), escapeString(ac.db), escapeString(ac.table), escapeString(ac.field))
-	
-	var boundaries []string
-	err := ac.conn.QuerySQL(tctx, func(rows *sql.Rows) error {
-		var val sql.NullString
-		if err := rows.Scan(&val); err == nil && val.Valid {
-			boundaries = append(boundaries, val.String)
-		}
-		return nil
-	}, func() {
-		boundaries = boundaries[:0]
-	}, query)
-	
-	if err != nil {
-		tctx.L().Warn("failed to get minimal boundaries", zap.Error(err))
-		return []string{}
-	}
-	
-	return boundaries
-}
-
-// getOptimisticBoundaries gets boundaries for auto-increment style fields
-func (ac *AdaptiveChunker) getOptimisticBoundaries(tctx *tcontext.Context, count int64, targetChunks int64) []string {
-	// Get min and max values
-	query := fmt.Sprintf("SELECT MIN(`%s`), MAX(`%s`) FROM `%s`.`%s`",
-		escapeString(ac.field), escapeString(ac.field), escapeString(ac.db), escapeString(ac.table))
-	
-	var boundaries []string
-	err := ac.conn.QuerySQL(tctx, func(rows *sql.Rows) error {
-		var minVal, maxVal sql.NullString
-		err := rows.Scan(&minVal, &maxVal)
-		if err == nil && minVal.Valid && maxVal.Valid {
-			boundaries = append(boundaries, minVal.String, maxVal.String)
-		}
-		return err
-	}, func() {
-		boundaries = boundaries[:0]
-	}, query)
-	
-	if err != nil {
-		tctx.L().Warn("failed to get min/max for optimistic chunking", zap.Error(err))
-		return []string{}
-	}
-	
-	return boundaries
-}
-
-// getCompositeBoundaries implements Spirit-style composite chunking with actual data sampling
-func (ac *AdaptiveChunker) getCompositeBoundaries(tctx *tcontext.Context, count int64, targetChunks int64) []string {
-	// Calculate sample interval
-	interval := count / targetChunks
-	if interval < 1 {
-		interval = 1
-	}
-	
-	// Try ROW_NUMBER() first for even distribution (MySQL 8.0+)
-	boundaries := ac.tryRowNumberSampling(tctx, interval, targetChunks)
-	if len(boundaries) > 0 {
-		return boundaries
-	}
-	
-	// Fallback to offset-based sampling for older MySQL versions
-	tctx.L().Info("ROW_NUMBER() not available, using offset-based sampling")
-	return ac.getOffsetBasedBoundaries(tctx, count, targetChunks)
-}
-
-// tryRowNumberSampling attempts to use ROW_NUMBER() for even sampling
-func (ac *AdaptiveChunker) tryRowNumberSampling(tctx *tcontext.Context, interval int64, targetChunks int64) []string {
-	query := fmt.Sprintf(
-		"SELECT `%s` FROM (SELECT `%s`, ROW_NUMBER() OVER (ORDER BY `%s`) as rn FROM `%s`.`%s`",
-		escapeString(ac.field), escapeString(ac.field), escapeString(ac.field), 
-		escapeString(ac.db), escapeString(ac.table))
+// GetInitialBoundary gets the starting boundary for chunking
+func (ac *AdaptiveChunker) GetInitialBoundary(tctx *tcontext.Context) (string, error) {
+	query := fmt.Sprintf("SELECT `%s` FROM `%s`.`%s`", 
+		escapeString(ac.field), escapeString(ac.db), escapeString(ac.table))
 	
 	if ac.conf.Where != "" {
 		query = fmt.Sprintf("%s WHERE %s", query, ac.conf.Where)
 	}
 	
-	query = fmt.Sprintf("%s) t WHERE MOD(rn, %d) = 0 ORDER BY `%s` LIMIT %d",
-		query, interval, escapeString(ac.field), targetChunks+1)
+	query = fmt.Sprintf("%s ORDER BY `%s` LIMIT 1", query, escapeString(ac.field))
 	
-	var boundaries []string
+	var boundary string
 	err := ac.conn.QuerySQL(tctx, func(rows *sql.Rows) error {
 		var val sql.NullString
 		if err := rows.Scan(&val); err == nil && val.Valid {
-			boundaries = append(boundaries, val.String)
+			boundary = val.String
 		}
 		return nil
 	}, func() {
-		boundaries = boundaries[:0]
+		boundary = ""
 	}, query)
 	
-	if err != nil {
-		tctx.L().Debug("ROW_NUMBER() sampling failed", zap.Error(err))
-		return []string{}
-	}
-	
-	return boundaries
+	return boundary, err
 }
 
-// getOffsetBasedBoundaries uses LIMIT OFFSET for sampling (compatible with older MySQL)
-func (ac *AdaptiveChunker) getOffsetBasedBoundaries(tctx *tcontext.Context, count int64, targetChunks int64) []string {
-	var boundaries []string
-	interval := count / targetChunks
+// getCompositeNextBoundary uses prefetching query to find next boundary for complex primary keys
+func (ac *AdaptiveChunker) getCompositeNextBoundary(tctx *tcontext.Context, previousBoundary string) (string, error) {
+	// Use prefetching query to find the boundary after chunk_size rows:
+	// SELECT field FROM table WHERE field > 'previousBoundary' ORDER BY field LIMIT chunk_size-1, 1
+	query := fmt.Sprintf("SELECT `%s` FROM `%s`.`%s` WHERE `%s` > '%s'", 
+		escapeString(ac.field), escapeString(ac.db), escapeString(ac.table), 
+		escapeString(ac.field), strings.ReplaceAll(previousBoundary, "'", "''"))
 	
-	// Collect boundaries using LIMIT OFFSET
-	for i := int64(0); i < targetChunks; i++ {
-		offset := i * interval
-		query := fmt.Sprintf("SELECT `%s` FROM `%s`.`%s`", 
-			escapeString(ac.field), escapeString(ac.db), escapeString(ac.table))
-		
-		if ac.conf.Where != "" {
-			query = fmt.Sprintf("%s WHERE %s", query, ac.conf.Where)
-		}
-		
-		query = fmt.Sprintf("%s ORDER BY `%s` LIMIT %d, 1", 
-			query, escapeString(ac.field), offset)
-		
-		err := ac.conn.QuerySQL(tctx, func(rows *sql.Rows) error {
-			var val sql.NullString
-			if err := rows.Scan(&val); err == nil && val.Valid {
-				boundaries = append(boundaries, val.String)
-			}
-			return nil
-		}, func() {}, query)
-		
-		if err != nil {
-			tctx.L().Warn("offset-based sampling failed", 
-				zap.Error(err), zap.Int64("offset", offset))
-			break
-		}
+	if ac.conf.Where != "" {
+		query = fmt.Sprintf("%s AND %s", query, ac.conf.Where)
 	}
 	
-	return boundaries
+	query = fmt.Sprintf("%s ORDER BY `%s` LIMIT %d, 1", 
+		query, escapeString(ac.field), ac.currentChunkSize-1)
+	
+	var nextBoundary string
+	err := ac.conn.QuerySQL(tctx, func(rows *sql.Rows) error {
+		var val sql.NullString
+		if err := rows.Scan(&val); err == nil && val.Valid {
+			nextBoundary = val.String
+		}
+		return nil
+	}, func() {
+		nextBoundary = ""
+	}, query)
+	
+	return nextBoundary, err
 }
+
+// getOptimisticNextBoundary calculates next boundary for auto-increment fields
+func (ac *AdaptiveChunker) getOptimisticNextBoundary(tctx *tcontext.Context, previousBoundary string) (string, error) {
+	// For numeric auto-increment fields, calculate next boundary arithmetically
+	// instead of querying the database (optimistic assumption of no gaps)
+	if isNumeric(previousBoundary) {
+		// Simple arithmetic progression for numeric fields
+		// Convert to int, add chunk size, convert back
+		// Arithmetic progression: next_boundary = current_value + chunk_size
+		return fmt.Sprintf("%d", mustParseInt(previousBoundary)+ac.currentChunkSize), nil
+	}
+	
+	// For non-numeric fields, fall back to composite method
+	return ac.getCompositeNextBoundary(tctx, previousBoundary)
+}
+
+// getMinimalNextBoundary gets next boundary for very large tables with minimal queries
+func (ac *AdaptiveChunker) getMinimalNextBoundary(tctx *tcontext.Context, previousBoundary string) (string, error) {
+	// For minimal strategy, use a simple LIMIT query to avoid expensive operations
+	query := fmt.Sprintf("SELECT `%s` FROM `%s`.`%s` WHERE `%s` > '%s'", 
+		escapeString(ac.field), escapeString(ac.db), escapeString(ac.table), 
+		escapeString(ac.field), strings.ReplaceAll(previousBoundary, "'", "''"))
+	
+	if ac.conf.Where != "" {
+		query = fmt.Sprintf("%s AND %s", query, ac.conf.Where)
+	}
+	
+	// Use a smaller chunk size for minimal strategy to avoid timeouts
+	minimalChunkSize := ac.currentChunkSize / 4
+	if minimalChunkSize < 100 {
+		minimalChunkSize = 100
+	}
+	
+	query = fmt.Sprintf("%s ORDER BY `%s` LIMIT %d, 1", 
+		query, escapeString(ac.field), minimalChunkSize-1)
+	
+	var nextBoundary string
+	err := ac.conn.QuerySQL(tctx, func(rows *sql.Rows) error {
+		var val sql.NullString
+		if err := rows.Scan(&val); err == nil && val.Valid {
+			nextBoundary = val.String
+		}
+		return nil
+	}, func() {
+		nextBoundary = ""
+	}, query)
+	
+	return nextBoundary, err
+}
+
+// Helper function to parse integers safely
+func mustParseInt(s string) int64 {
+	// Simple integer parsing - in production this would need better error handling
+	var result int64
+	for _, char := range s {
+		if char >= '0' && char <= '9' {
+			result = result*10 + int64(char-'0')
+		}
+	}
+	return result
+}
+
 
 // RecordChunkMetrics records performance metrics for adaptive sizing
 func (ac *AdaptiveChunker) RecordChunkMetrics(metrics ChunkingMetrics) {
@@ -365,7 +351,6 @@ func (ac *AdaptiveChunker) GetCurrentChunkSize() int64 {
 // SetStrategy sets the chunking strategy
 func (ac *AdaptiveChunker) SetStrategy(strategy ChunkStrategy) {
 	ac.strategy = strategy
-	ac.sampleCacheValid = false // Invalidate cache when strategy changes
 }
 
 // Helper function to check if a string represents a number

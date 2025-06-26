@@ -27,15 +27,13 @@ func TestAdaptiveChunkingIntegration(t *testing.T) {
 			fieldName:        "email",
 			expectedStrategy: StrategyMinimal,
 			setupMocks: func(mock sqlmock.Sqlmock) {
-				// Mock the count estimation
-				mock.ExpectQuery("SELECT.*COUNT").WillReturnRows(
-					sqlmock.NewRows([]string{"count"}).AddRow(LargeTableThreshold * 2))
+				// Mock initial boundary query
+				mock.ExpectQuery("SELECT .* ORDER BY .* LIMIT 1").WillReturnRows(
+					sqlmock.NewRows([]string{"email"}).AddRow("aaa@example.com"))
 				
-				// Mock minimal boundaries query
-				mock.ExpectQuery("\\(SELECT .* LIMIT 1\\) UNION ALL").WillReturnRows(
-					sqlmock.NewRows([]string{"email"}).
-						AddRow("aaa@example.com").
-						AddRow("zzz@example.com"))
+				// Mock next boundary query for minimal strategy
+				mock.ExpectQuery("SELECT .* WHERE .* > .* ORDER BY .* LIMIT").WillReturnRows(
+					sqlmock.NewRows([]string{"email"}).AddRow("zzz@example.com"))
 			},
 		},
 		{
@@ -44,18 +42,16 @@ func TestAdaptiveChunkingIntegration(t *testing.T) {
 			tableSize:        50000,
 			expectedStrategy: StrategyOptimistic,
 			setupMocks: func(mock sqlmock.Sqlmock) {
-				// Mock the count estimation
-				mock.ExpectQuery("SELECT.*COUNT").WillReturnRows(
-					sqlmock.NewRows([]string{"count"}).AddRow(50000))
-				
 				// Mock auto-increment detection
 				mock.ExpectQuery("SELECT .* ORDER BY .* LIMIT 3").WillReturnRows(
 					sqlmock.NewRows([]string{"user_id"}).
 						AddRow("1").AddRow("2").AddRow("3"))
 				
-				// Mock min/max query for optimistic strategy
-				mock.ExpectQuery("SELECT MIN\\(.+\\), MAX\\(.+\\)").WillReturnRows(
-					sqlmock.NewRows([]string{"MIN", "MAX"}).AddRow("1", "50000"))
+				// Mock initial boundary query
+				mock.ExpectQuery("SELECT .* ORDER BY .* LIMIT 1").WillReturnRows(
+					sqlmock.NewRows([]string{"user_id"}).AddRow("1"))
+				
+				// No additional mock needed for optimistic numeric calculation
 			},
 		},
 		{
@@ -64,21 +60,14 @@ func TestAdaptiveChunkingIntegration(t *testing.T) {
 			tableSize:        10000,
 			expectedStrategy: StrategyComposite,
 			setupMocks: func(mock sqlmock.Sqlmock) {
-				// Mock the count estimation
-				mock.ExpectQuery("SELECT.*COUNT").WillReturnRows(
-					sqlmock.NewRows([]string{"count"}).AddRow(10000))
+				// Since "product_code" doesn't contain "id", isLikelyAutoIncrement won't query the DB
+				// So the first query will be GetInitialBoundary
+				mock.ExpectQuery("SELECT .* ORDER BY .* LIMIT 1").WillReturnRows(
+					sqlmock.NewRows([]string{"product_code"}).AddRow("ABC123"))
 				
-				// Mock auto-increment detection (returns non-numeric)
-				mock.ExpectQuery("SELECT .* ORDER BY .* LIMIT 3").WillReturnRows(
-					sqlmock.NewRows([]string{"product_code"}).
-						AddRow("ABC123").AddRow("DEF456").AddRow("GHI789"))
-				
-				// Mock ROW_NUMBER sampling for composite strategy
-				mock.ExpectQuery("SELECT .* FROM \\(SELECT .* ROW_NUMBER\\(\\)").WillReturnRows(
-					sqlmock.NewRows([]string{"product_code"}).
-						AddRow("ABC123").
-						AddRow("MNO456").
-						AddRow("XYZ789"))
+				// Mock next boundary query for composite strategy
+				mock.ExpectQuery("SELECT .* WHERE .* > .* ORDER BY .* LIMIT").WillReturnRows(
+					sqlmock.NewRows([]string{"product_code"}).AddRow("MNO456"))
 			},
 		},
 	}
@@ -107,15 +96,15 @@ func TestAdaptiveChunkingIntegration(t *testing.T) {
 			require.Equal(t, tt.expectedStrategy, strategy)
 			chunker.SetStrategy(strategy)
 
-			// Test boundary sampling
-			targetChunks := tt.tableSize / chunker.GetCurrentChunkSize()
-			if targetChunks == 0 {
-				targetChunks = 1
-			}
-
-			boundaries, err := chunker.GetSampleBoundaries(tctx, tt.tableSize, targetChunks)
+			// Test incremental boundary discovery chunking
+			initialBoundary, err := chunker.GetInitialBoundary(tctx)
 			require.NoError(t, err)
-			require.NotEmpty(t, boundaries)
+			require.NotEmpty(t, initialBoundary)
+			
+			// Test getting next boundary
+			_, err = chunker.GetNextChunkBoundary(tctx, initialBoundary)
+			require.NoError(t, err)
+			// Next boundary could be empty if this is the last chunk - that's valid
 
 			// Test performance tracking
 			metrics := ChunkingMetrics{
@@ -226,16 +215,13 @@ func TestChunkingStrategyFallback(t *testing.T) {
 	require.NoError(t, err)
 	defer db.Close()
 
-	// Set up sequential fallback scenarios
-	// 1. ROW_NUMBER fails
-	mock.ExpectQuery("SELECT .* FROM \\(SELECT .* ROW_NUMBER\\(\\)").
-		WillReturnError(fmt.Errorf("ROW_NUMBER not supported"))
+	// Test initial boundary query
+	mock.ExpectQuery("SELECT .* ORDER BY .* LIMIT 1").WillReturnRows(
+		sqlmock.NewRows([]string{"field"}).AddRow("start"))
 	
-	// 2. Fallback to offset-based sampling
-	for i := 0; i < 3; i++ {
-		mock.ExpectQuery("SELECT .* ORDER BY .* LIMIT \\d+, 1").WillReturnRows(
-			sqlmock.NewRows([]string{"field"}).AddRow(fmt.Sprintf("fallback_%d", i)))
-	}
+	// Test next boundary with fallback
+	mock.ExpectQuery("SELECT .* WHERE .* > .* ORDER BY .* LIMIT").WillReturnRows(
+		sqlmock.NewRows([]string{"field"}).AddRow("next"))
 
 	tctx := tcontext.Background()
 	conn, err := db.Conn(tctx)
@@ -246,14 +232,14 @@ func TestChunkingStrategyFallback(t *testing.T) {
 	chunker := NewAdaptiveChunker("test_db", "test_table", "name", conf, baseConn)
 	chunker.SetStrategy(StrategyComposite)
 
-	boundaries, err := chunker.GetSampleBoundaries(tctx, 1000, 3)
+	// Test incremental boundary discovery
+	initialBoundary, err := chunker.GetInitialBoundary(tctx)
 	require.NoError(t, err)
-	require.Len(t, boundaries, 3)
+	require.Equal(t, "start", initialBoundary)
 	
-	// Verify fallback boundaries
-	for i, boundary := range boundaries {
-		require.Equal(t, fmt.Sprintf("fallback_%d", i), boundary)
-	}
+	nextBoundary, err := chunker.GetNextChunkBoundary(tctx, initialBoundary)
+	require.NoError(t, err)
+	require.Equal(t, "next", nextBoundary)
 }
 
 // BenchmarkAdaptiveChunking benchmarks the performance of adaptive chunking vs traditional
@@ -297,9 +283,9 @@ func TestErrorHandling(t *testing.T) {
 	chunker := NewAdaptiveChunker("test_db", "test_table", "id", conf, baseConn)
 	chunker.SetStrategy(StrategyOptimistic)
 
-	boundaries, err := chunker.GetSampleBoundaries(tctx, 1000, 5)
+	// Test error handling in incremental boundary discovery
+	_, err = chunker.GetInitialBoundary(tctx)
 	
-	// Should handle the error gracefully and return empty boundaries
-	require.NoError(t, err) // Our implementation should not propagate DB errors for sampling
-	require.Empty(t, boundaries)
+	// Should handle the error gracefully
+	require.Error(t, err) // Database errors should be propagated for boundary discovery
 }
