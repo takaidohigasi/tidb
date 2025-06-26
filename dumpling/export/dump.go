@@ -993,31 +993,64 @@ func (d *Dumper) concurrentDumpTableByString(tctx *tcontext.Context, conn *BaseC
 		// If ROW_NUMBER() fails, fallback to hash-based sampling
 		// This happens on older MySQL versions (< 8.0) or MariaDB (< 10.2)
 		if err != nil {
-			tctx.L().Info("ROW_NUMBER() not supported, using fallback sampling", log.ShortError(err))
+			tctx.L().Info("ROW_NUMBER sampling failed, trying simpler approach", log.ShortError(err))
 			sampleValues = sampleValues[:0] // Reset sample values
 			
-			// Use hash-based sampling as fallback (compatible with older MySQL/MariaDB)
-			simpleSampleQuery := fmt.Sprintf("SELECT `%s` FROM `%s`.`%s`", escapeString(field), escapeString(db), escapeString(tbl))
-			whereClause := fmt.Sprintf("MOD(CRC32(`%s`), %d) = 0", escapeString(field), int(interval))
-			if conf.Where != "" {
-				simpleSampleQuery = fmt.Sprintf("%s WHERE %s AND %s", simpleSampleQuery, conf.Where, whereClause)
-			} else {
-				simpleSampleQuery = fmt.Sprintf("%s WHERE %s", simpleSampleQuery, whereClause)
-			}
-			simpleSampleQuery = fmt.Sprintf("%s ORDER BY `%s` LIMIT %d",
-				simpleSampleQuery, escapeString(field), estimatedChunks+1)
-
-			tctx.L().Debug("using fallback hash sampling", zap.String("query", simpleSampleQuery))
-			err = conn.QuerySQL(tctx, func(rows *sql.Rows) error {
-				var val sql.NullString
-				err := rows.Scan(&val)
-				if err == nil && val.Valid {
-					sampleValues = append(sampleValues, val.String)
+			// For very large tables, CRC32 sampling can also be expensive and cause timeouts
+			// Try a limited approach first before falling back to sequential dump
+			if count > 100000000 { // 100M+ rows
+				tctx.L().Info("large table detected, using minimal sampling to avoid timeouts", 
+					zap.Int64("rowCount", count))
+				
+				// Use a much simpler query that's less likely to timeout
+				simplestQuery := fmt.Sprintf("SELECT `%s` FROM `%s`.`%s`", 
+					escapeString(field), escapeString(db), escapeString(tbl))
+				if conf.Where != "" {
+					simplestQuery = fmt.Sprintf("%s WHERE %s", simplestQuery, conf.Where)
 				}
-				return err
-			}, func() {
-				sampleValues = sampleValues[:0]
-			}, simpleSampleQuery)
+				simplestQuery = fmt.Sprintf("%s ORDER BY `%s` LIMIT 0, 1", 
+					simplestQuery, escapeString(field))
+				
+				tctx.L().Debug("using minimal sampling for large table", zap.String("query", simplestQuery))
+				err = conn.QuerySQL(tctx, func(rows *sql.Rows) error {
+					var val sql.NullString
+					err := rows.Scan(&val)
+					if err == nil && val.Valid {
+						sampleValues = append(sampleValues, val.String)
+					}
+					return err
+				}, func() {
+					sampleValues = sampleValues[:0]
+				}, simplestQuery)
+				
+				// If even the minimal query fails, immediately fall back to sequential
+				if err != nil {
+					tctx.L().Info("minimal sampling failed, falling back to sequential dump", log.ShortError(err))
+				}
+			} else {
+				// Use hash-based sampling as fallback (compatible with older MySQL/MariaDB)
+				simpleSampleQuery := fmt.Sprintf("SELECT `%s` FROM `%s`.`%s`", escapeString(field), escapeString(db), escapeString(tbl))
+				whereClause := fmt.Sprintf("MOD(CRC32(`%s`), %d) = 0", escapeString(field), int(interval))
+				if conf.Where != "" {
+					simpleSampleQuery = fmt.Sprintf("%s WHERE %s AND %s", simpleSampleQuery, conf.Where, whereClause)
+				} else {
+					simpleSampleQuery = fmt.Sprintf("%s WHERE %s", simpleSampleQuery, whereClause)
+				}
+				simpleSampleQuery = fmt.Sprintf("%s ORDER BY `%s` LIMIT %d",
+					simpleSampleQuery, escapeString(field), estimatedChunks+1)
+
+				tctx.L().Debug("using fallback hash sampling", zap.String("query", simpleSampleQuery))
+				err = conn.QuerySQL(tctx, func(rows *sql.Rows) error {
+					var val sql.NullString
+					err := rows.Scan(&val)
+					if err == nil && val.Valid {
+						sampleValues = append(sampleValues, val.String)
+					}
+					return err
+				}, func() {
+					sampleValues = sampleValues[:0]
+				}, simpleSampleQuery)
+			}
 		}
 	}
 
