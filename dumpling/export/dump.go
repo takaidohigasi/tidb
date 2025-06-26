@@ -929,12 +929,28 @@ func (d *Dumper) selectMinAndMaxStringValue(tctx *tcontext.Context, conn *BaseCo
 	return smin.String, smax.String, nil
 }
 
+// getStrategyName returns human-readable strategy names for logging
+func getStrategyName(strategy ChunkStrategy) string {
+	switch strategy {
+	case StrategySequential:
+		return "sequential"
+	case StrategyOptimistic:
+		return "optimistic"
+	case StrategyComposite:
+		return "composite"
+	case StrategyMinimal:
+		return "minimal"
+	default:
+		return "unknown"
+	}
+}
+
 func (d *Dumper) concurrentDumpTableByString(tctx *tcontext.Context, conn *BaseConn, meta TableMeta, taskChan chan<- Task, field string) error {
 	db, tbl := meta.DatabaseName(), meta.TableName()
 	conf := d.conf
 
 	count := estimateCount(d.tctx, db, tbl, conn, field, conf)
-	tctx.L().Info("get estimated rows count for string field",
+	tctx.L().Info("get estimated rows count for adaptive string chunking",
 		zap.String("database", db),
 		zap.String("table", tbl),
 		zap.String("field", field),
@@ -949,110 +965,23 @@ func (d *Dumper) concurrentDumpTableByString(tctx *tcontext.Context, conn *BaseC
 		return d.dumpWholeTableDirectly(tctx, meta, taskChan, "", orderByClause, 0, 1)
 	}
 
-	// Use sampling approach for string-based chunking
-	estimatedChunks := count / conf.Rows
-	if estimatedChunks == 0 {
-		estimatedChunks = 1
+	// Create adaptive chunker with Spirit-inspired strategies
+	chunker := NewAdaptiveChunker(db, tbl, field, conf, conn)
+	strategy := chunker.DetermineStrategy(tctx, int64(count))
+	chunker.SetStrategy(strategy)
+
+	tctx.L().Info("selected chunking strategy",
+		zap.String("strategy", getStrategyName(strategy)),
+		zap.Int64("currentChunkSize", chunker.GetCurrentChunkSize()))
+
+	// Calculate target number of chunks based on adaptive chunk size
+	targetChunks := int64(count) / chunker.GetCurrentChunkSize()
+	if targetChunks == 0 {
+		targetChunks = 1
 	}
 
-	// Get distributed sample values across the dataset for better chunking
-	var sampleValues []string
-	var err error
-
-	// Try ROW_NUMBER() based sampling first for better distribution
-	// ROW_NUMBER() is supported on MySQL 8.0+, MariaDB 10.2+, TiDB, and most modern databases
-	if estimatedChunks > 1 {
-		// Calculate intervals to get evenly distributed samples
-		interval := count / estimatedChunks
-		if interval < 1 {
-			interval = 1
-		}
-
-		// First try ROW_NUMBER() approach (MySQL 8.0+, MariaDB 10.2+, TiDB)
-		sampleQuery := fmt.Sprintf(
-			"SELECT `%s` FROM (SELECT `%s`, ROW_NUMBER() OVER (ORDER BY `%s`) as rn FROM `%s`.`%s`",
-			escapeString(field), escapeString(field), escapeString(field), escapeString(db), escapeString(tbl))
-		if conf.Where != "" {
-			sampleQuery = fmt.Sprintf("%s WHERE %s", sampleQuery, conf.Where)
-		}
-		sampleQuery = fmt.Sprintf("%s) t WHERE MOD(rn, %d) = 0 ORDER BY `%s` LIMIT %d",
-			sampleQuery, interval, escapeString(field), estimatedChunks+1)
-
-		tctx.L().Debug("trying ROW_NUMBER() sampling", zap.String("query", sampleQuery))
-		err = conn.QuerySQL(tctx, func(rows *sql.Rows) error {
-			var val sql.NullString
-			err := rows.Scan(&val)
-			if err == nil && val.Valid {
-				sampleValues = append(sampleValues, val.String)
-			}
-			return err
-		}, func() {
-			sampleValues = sampleValues[:0]
-		}, sampleQuery)
-
-		// If ROW_NUMBER() fails, fallback to hash-based sampling
-		// This happens on older MySQL versions (< 8.0) or MariaDB (< 10.2)
-		if err != nil {
-			tctx.L().Info("ROW_NUMBER sampling failed, trying simpler approach", log.ShortError(err))
-			sampleValues = sampleValues[:0] // Reset sample values
-			
-			// For very large tables, CRC32 sampling can also be expensive and cause timeouts
-			// Try a limited approach first before falling back to sequential dump
-			if count > 100000000 { // 100M+ rows
-				tctx.L().Info("large table detected, using minimal sampling to avoid timeouts", 
-					zap.Int64("rowCount", count))
-				
-				// Use a much simpler query that's less likely to timeout
-				simplestQuery := fmt.Sprintf("SELECT `%s` FROM `%s`.`%s`", 
-					escapeString(field), escapeString(db), escapeString(tbl))
-				if conf.Where != "" {
-					simplestQuery = fmt.Sprintf("%s WHERE %s", simplestQuery, conf.Where)
-				}
-				simplestQuery = fmt.Sprintf("%s ORDER BY `%s` LIMIT 0, 1", 
-					simplestQuery, escapeString(field))
-				
-				tctx.L().Debug("using minimal sampling for large table", zap.String("query", simplestQuery))
-				err = conn.QuerySQL(tctx, func(rows *sql.Rows) error {
-					var val sql.NullString
-					err := rows.Scan(&val)
-					if err == nil && val.Valid {
-						sampleValues = append(sampleValues, val.String)
-					}
-					return err
-				}, func() {
-					sampleValues = sampleValues[:0]
-				}, simplestQuery)
-				
-				// If even the minimal query fails, immediately fall back to sequential
-				if err != nil {
-					tctx.L().Info("minimal sampling failed, falling back to sequential dump", log.ShortError(err))
-				}
-			} else {
-				// Use hash-based sampling as fallback (compatible with older MySQL/MariaDB)
-				simpleSampleQuery := fmt.Sprintf("SELECT `%s` FROM `%s`.`%s`", escapeString(field), escapeString(db), escapeString(tbl))
-				whereClause := fmt.Sprintf("MOD(CRC32(`%s`), %d) = 0", escapeString(field), int(interval))
-				if conf.Where != "" {
-					simpleSampleQuery = fmt.Sprintf("%s WHERE %s AND %s", simpleSampleQuery, conf.Where, whereClause)
-				} else {
-					simpleSampleQuery = fmt.Sprintf("%s WHERE %s", simpleSampleQuery, whereClause)
-				}
-				simpleSampleQuery = fmt.Sprintf("%s ORDER BY `%s` LIMIT %d",
-					simpleSampleQuery, escapeString(field), estimatedChunks+1)
-
-				tctx.L().Debug("using fallback hash sampling", zap.String("query", simpleSampleQuery))
-				err = conn.QuerySQL(tctx, func(rows *sql.Rows) error {
-					var val sql.NullString
-					err := rows.Scan(&val)
-					if err == nil && val.Valid {
-						sampleValues = append(sampleValues, val.String)
-					}
-					return err
-				}, func() {
-					sampleValues = sampleValues[:0]
-				}, simpleSampleQuery)
-			}
-		}
-	}
+	// Get sample boundaries using the adaptive approach
+	sampleValues, err := chunker.GetSampleBoundaries(tctx, int64(count), targetChunks)
 
 	if err != nil {
 		tctx.L().Info("fallback to sequential dump due to sampling error", log.ShortError(err))
@@ -1076,13 +1005,13 @@ func (d *Dumper) concurrentDumpTableByString(tctx *tcontext.Context, conn *BaseC
 		return d.dumpWholeTableDirectly(tctx, meta, taskChan, "", orderByClause, 0, 1)
 	}
 
-	tctx.L().Info("using string-based chunking with sample values",
+	tctx.L().Info("using adaptive string-based chunking with sample values",
 		zap.String("database", db),
 		zap.String("table", tbl),
 		zap.String("field", field),
 		zap.Int("sampleCount", len(sampleValues)),
 		zap.Uint64("estimatedRows", count),
-		zap.Uint64("targetRowsPerChunk", conf.Rows))
+		zap.Int64("adaptiveChunkSize", chunker.GetCurrentChunkSize()))
 
 	selectField, selectLen := meta.SelectedField(), meta.SelectedLen()
 	orderByClause := fmt.Sprintf("ORDER BY `%s`", escapeString(field))
@@ -1099,13 +1028,15 @@ func (d *Dumper) concurrentDumpTableByString(tctx *tcontext.Context, conn *BaseC
 		escapedValue := strings.ReplaceAll(sampleValues[0], "'", "''")
 		where := fmt.Sprintf("%s`%s` < '%s'", nullValueCondition, escapeString(field), escapedValue)
 		query := buildSelectQuery(db, tbl, selectField, "", buildWhereCondition(conf, where), orderByClause)
-		tctx.L().Debug("created string chunk",
+		tctx.L().Debug("created adaptive string chunk",
 			zap.String("database", db),
 			zap.String("table", tbl),
 			zap.Int("chunkIndex", chunkIndex),
 			zap.Int("totalChunks", totalChunks),
 			zap.String("condition", where))
-		task := d.newTaskTableData(meta, newTableData(query, selectLen, false), chunkIndex, totalChunks)
+		
+		// Create task with performance tracking
+		task := d.newTaskTableDataWithChunker(meta, newTableData(query, selectLen, false), chunkIndex, totalChunks, chunker)
 		ctxDone := d.sendTaskToChan(tctx, task, taskChan)
 		if ctxDone {
 			return tctx.Err()
@@ -1122,13 +1053,15 @@ func (d *Dumper) concurrentDumpTableByString(tctx *tcontext.Context, conn *BaseC
 			escapeString(field), escapedValue1,
 			escapeString(field), escapedValue2)
 		query := buildSelectQuery(db, tbl, selectField, "", buildWhereCondition(conf, where), orderByClause)
-		tctx.L().Debug("created string chunk",
+		tctx.L().Debug("created adaptive string chunk",
 			zap.String("database", db),
 			zap.String("table", tbl),
 			zap.Int("chunkIndex", chunkIndex),
 			zap.Int("totalChunks", totalChunks),
 			zap.String("condition", where))
-		task := d.newTaskTableData(meta, newTableData(query, selectLen, false), chunkIndex, totalChunks)
+		
+		// Create task with performance tracking
+		task := d.newTaskTableDataWithChunker(meta, newTableData(query, selectLen, false), chunkIndex, totalChunks, chunker)
 		ctxDone := d.sendTaskToChan(tctx, task, taskChan)
 		if ctxDone {
 			return tctx.Err()
@@ -1141,13 +1074,15 @@ func (d *Dumper) concurrentDumpTableByString(tctx *tcontext.Context, conn *BaseC
 		escapedValue := strings.ReplaceAll(sampleValues[len(sampleValues)-1], "'", "''")
 		where := fmt.Sprintf("`%s` >= '%s'", escapeString(field), escapedValue)
 		query := buildSelectQuery(db, tbl, selectField, "", buildWhereCondition(conf, where), orderByClause)
-		tctx.L().Debug("created string chunk",
+		tctx.L().Debug("created adaptive string chunk",
 			zap.String("database", db),
 			zap.String("table", tbl),
 			zap.Int("chunkIndex", chunkIndex),
 			zap.Int("totalChunks", totalChunks),
 			zap.String("condition", where))
-		task := d.newTaskTableData(meta, newTableData(query, selectLen, false), chunkIndex, totalChunks)
+		
+		// Create task with performance tracking
+		task := d.newTaskTableDataWithChunker(meta, newTableData(query, selectLen, false), chunkIndex, totalChunks, chunker)
 		ctxDone := d.sendTaskToChan(tctx, task, taskChan)
 		if ctxDone {
 			return tctx.Err()
@@ -1998,4 +1933,9 @@ func (d *Dumper) renewSelectTableRegionFuncForLowerTiDB(tctx *tcontext.Context) 
 func (d *Dumper) newTaskTableData(meta TableMeta, data TableDataIR, currentChunk, totalChunks int) *TaskTableData {
 	d.metrics.totalChunks.Add(1)
 	return NewTaskTableData(meta, data, currentChunk, totalChunks)
+}
+
+func (d *Dumper) newTaskTableDataWithChunker(meta TableMeta, data TableDataIR, currentChunk, totalChunks int, chunker *AdaptiveChunker) *TaskTableData {
+	d.metrics.totalChunks.Add(1)
+	return NewTaskTableDataWithChunker(meta, data, currentChunk, totalChunks, chunker)
 }

@@ -58,6 +58,7 @@ type TaskTableData struct {
 	Data        TableDataIR
 	ChunkIndex  int
 	TotalChunks int
+	Chunker     *AdaptiveChunker // Optional chunker for performance tracking
 }
 
 // NewTaskDatabaseMeta returns a new dumping database metadata task
@@ -111,6 +112,17 @@ func NewTaskTableData(meta TableMeta, data TableDataIR, currentChunk, totalChunk
 		Data:        data,
 		ChunkIndex:  currentChunk,
 		TotalChunks: totalChunks,
+	}
+}
+
+// NewTaskTableDataWithChunker returns a new dumping table data task with adaptive chunker
+func NewTaskTableDataWithChunker(meta TableMeta, data TableDataIR, currentChunk, totalChunks int, chunker *AdaptiveChunker) *TaskTableData {
+	return &TaskTableData{
+		Meta:        meta,
+		Data:        data,
+		ChunkIndex:  currentChunk,
+		TotalChunks: totalChunks,
+		Chunker:     chunker,
 	}
 }
 
