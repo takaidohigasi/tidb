@@ -959,7 +959,8 @@ func (d *Dumper) concurrentDumpTableByString(tctx *tcontext.Context, conn *BaseC
 	var sampleValues []string
 	var err error
 
-	// Use ROW_NUMBER() based sampling for better distribution
+	// Try ROW_NUMBER() based sampling first for better distribution
+	// ROW_NUMBER() is supported on MySQL 8.0+, MariaDB 10.2+, TiDB, and most modern databases
 	if estimatedChunks > 1 {
 		// Calculate intervals to get evenly distributed samples
 		interval := count / estimatedChunks
@@ -967,7 +968,7 @@ func (d *Dumper) concurrentDumpTableByString(tctx *tcontext.Context, conn *BaseC
 			interval = 1
 		}
 
-		// Sample using ROW_NUMBER() to get distributed values
+		// First try ROW_NUMBER() approach (MySQL 8.0+, MariaDB 10.2+, TiDB)
 		sampleQuery := fmt.Sprintf(
 			"SELECT `%s` FROM (SELECT `%s`, ROW_NUMBER() OVER (ORDER BY `%s`) as rn FROM `%s`.`%s`",
 			escapeString(field), escapeString(field), escapeString(field), escapeString(db), escapeString(tbl))
@@ -977,6 +978,7 @@ func (d *Dumper) concurrentDumpTableByString(tctx *tcontext.Context, conn *BaseC
 		sampleQuery = fmt.Sprintf("%s) t WHERE MOD(rn, %d) = 0 ORDER BY `%s` LIMIT %d",
 			sampleQuery, interval, escapeString(field), estimatedChunks+1)
 
+		tctx.L().Debug("trying ROW_NUMBER() sampling", zap.String("query", sampleQuery))
 		err = conn.QuerySQL(tctx, func(rows *sql.Rows) error {
 			var val sql.NullString
 			err := rows.Scan(&val)
@@ -988,10 +990,13 @@ func (d *Dumper) concurrentDumpTableByString(tctx *tcontext.Context, conn *BaseC
 			sampleValues = sampleValues[:0]
 		}, sampleQuery)
 
-		// Fallback to simpler sampling if ROW_NUMBER() approach fails
+		// If ROW_NUMBER() fails, fallback to hash-based sampling
+		// This happens on older MySQL versions (< 8.0) or MariaDB (< 10.2)
 		if err != nil {
-			tctx.L().Info("ROW_NUMBER sampling failed, trying simpler approach", log.ShortError(err))
-			// Use modulo-based sampling as fallback
+			tctx.L().Info("ROW_NUMBER() not supported, using fallback sampling", log.ShortError(err))
+			sampleValues = sampleValues[:0] // Reset sample values
+			
+			// Use hash-based sampling as fallback (compatible with older MySQL/MariaDB)
 			simpleSampleQuery := fmt.Sprintf("SELECT `%s` FROM `%s`.`%s`", escapeString(field), escapeString(db), escapeString(tbl))
 			whereClause := fmt.Sprintf("MOD(CRC32(`%s`), %d) = 0", escapeString(field), int(interval))
 			if conf.Where != "" {
@@ -1002,6 +1007,7 @@ func (d *Dumper) concurrentDumpTableByString(tctx *tcontext.Context, conn *BaseC
 			simpleSampleQuery = fmt.Sprintf("%s ORDER BY `%s` LIMIT %d",
 				simpleSampleQuery, escapeString(field), estimatedChunks+1)
 
+			tctx.L().Debug("using fallback hash sampling", zap.String("query", simpleSampleQuery))
 			err = conn.QuerySQL(tctx, func(rows *sql.Rows) error {
 				var val sql.NullString
 				err := rows.Scan(&val)
