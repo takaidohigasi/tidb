@@ -974,17 +974,10 @@ func (d *Dumper) concurrentDumpTableByString(tctx *tcontext.Context, conn *BaseC
 		zap.String("strategy", getStrategyName(strategy)),
 		zap.Int64("currentChunkSize", chunker.GetCurrentChunkSize()))
 
-	// Calculate target number of chunks based on adaptive chunk size
-	targetChunks := int64(count) / chunker.GetCurrentChunkSize()
-	if targetChunks == 0 {
-		targetChunks = 1
-	}
-
-	// Get sample boundaries using the adaptive approach
-	sampleValues, err := chunker.GetSampleBoundaries(tctx, int64(count), targetChunks)
-
+	// Get initial boundary using Spirit's approach (no pre-calculated sampling)
+	initialBoundary, err := chunker.GetInitialBoundary(tctx)
 	if err != nil {
-		tctx.L().Info("fallback to sequential dump due to sampling error", log.ShortError(err))
+		tctx.L().Info("failed to get initial boundary, falling back to sequential dump", log.ShortError(err))
 		orderByClause, err := buildOrderByClause(tctx, conf, conn, db, tbl, meta.HasImplicitRowID())
 		if err != nil {
 			return err
@@ -992,12 +985,11 @@ func (d *Dumper) concurrentDumpTableByString(tctx *tcontext.Context, conn *BaseC
 		return d.dumpWholeTableDirectly(tctx, meta, taskChan, "", orderByClause, 0, 1)
 	}
 
-	if len(sampleValues) <= 1 {
-		tctx.L().Info("insufficient sample values for chunking, falling back to sequential dump",
+	if initialBoundary == "" {
+		tctx.L().Info("no initial boundary found, falling back to sequential dump",
 			zap.String("database", db),
 			zap.String("table", tbl),
-			zap.String("field", field),
-			zap.Int("sampleCount", len(sampleValues)))
+			zap.String("field", field))
 		orderByClause, err := buildOrderByClause(tctx, conf, conn, db, tbl, meta.HasImplicitRowID())
 		if err != nil {
 			return err
@@ -1005,89 +997,70 @@ func (d *Dumper) concurrentDumpTableByString(tctx *tcontext.Context, conn *BaseC
 		return d.dumpWholeTableDirectly(tctx, meta, taskChan, "", orderByClause, 0, 1)
 	}
 
-	tctx.L().Info("using adaptive string-based chunking with sample values",
+	tctx.L().Info("using incremental boundary discovery for adaptive chunking",
 		zap.String("database", db),
 		zap.String("table", tbl),
 		zap.String("field", field),
-		zap.Int("sampleCount", len(sampleValues)),
+		zap.String("initialBoundary", initialBoundary),
 		zap.Uint64("estimatedRows", count),
 		zap.Int64("adaptiveChunkSize", chunker.GetCurrentChunkSize()))
 
 	selectField, selectLen := meta.SelectedField(), meta.SelectedLen()
 	orderByClause := fmt.Sprintf("ORDER BY `%s`", escapeString(field))
-	totalChunks := len(sampleValues)
 
+	// Incremental chunking: generate chunks dynamically using prefetching queries
 	chunkIndex := 0
-	nullValueCondition := ""
-	if conf.Where == "" {
-		nullValueCondition = fmt.Sprintf("`%s` IS NULL OR ", escapeString(field))
-	}
+	currentBoundary := initialBoundary
+	maxChunks := int(int64(count)/chunker.GetCurrentChunkSize()) + 10 // Safety limit
 
-	// First chunk: NULL values and values < first sample
-	if len(sampleValues) > 0 {
-		escapedValue := strings.ReplaceAll(sampleValues[0], "'", "''")
-		where := fmt.Sprintf("%s`%s` < '%s'", nullValueCondition, escapeString(field), escapedValue)
-		query := buildSelectQuery(db, tbl, selectField, "", buildWhereCondition(conf, where), orderByClause)
-		tctx.L().Debug("created adaptive string chunk",
-			zap.String("database", db),
-			zap.String("table", tbl),
-			zap.Int("chunkIndex", chunkIndex),
-			zap.Int("totalChunks", totalChunks),
-			zap.String("condition", where))
+	for chunkIndex < maxChunks {
+		// Get next boundary using prefetching query: SELECT field FROM table WHERE field > current ORDER BY field LIMIT chunk_size-1, 1
+		nextBoundary, err := chunker.GetNextChunkBoundary(tctx, currentBoundary)
 		
-		// Create task with performance tracking
-		task := d.newTaskTableDataWithChunker(meta, newTableData(query, selectLen, false), chunkIndex, totalChunks, chunker)
+		var where string
+		if err != nil || nextBoundary == "" {
+			// This is the last chunk - include all remaining rows
+			where = fmt.Sprintf("`%s` >= '%s'", escapeString(field), 
+				strings.ReplaceAll(currentBoundary, "'", "''"))
+			
+			tctx.L().Debug("creating final chunk", 
+				zap.String("boundary", currentBoundary))
+		} else {
+			// Regular chunk: currentBoundary <= field < nextBoundary
+			where = fmt.Sprintf("`%s` >= '%s' AND `%s` < '%s'",
+				escapeString(field), strings.ReplaceAll(currentBoundary, "'", "''"),
+				escapeString(field), strings.ReplaceAll(nextBoundary, "'", "''"))
+			
+			tctx.L().Debug("creating incremental chunk", 
+				zap.String("start", currentBoundary),
+				zap.String("end", nextBoundary))
+		}
+
+		query := buildSelectQuery(db, tbl, selectField, "", buildWhereCondition(conf, where), orderByClause)
+		
+		// Create task with performance tracking - note: totalChunks is estimated
+		estimatedTotalChunks := maxChunks
+		task := d.newTaskTableDataWithChunker(meta, newTableData(query, selectLen, false), chunkIndex, estimatedTotalChunks, chunker)
+		
 		ctxDone := d.sendTaskToChan(tctx, task, taskChan)
 		if ctxDone {
 			return tctx.Err()
 		}
+
 		chunkIndex++
-		nullValueCondition = ""
+		
+		// If this was the last chunk, break
+		if err != nil || nextBoundary == "" {
+			break
+		}
+		
+		currentBoundary = nextBoundary
 	}
 
-	// Middle chunks: between sample values
-	for i := 0; i < len(sampleValues)-1; i++ {
-		escapedValue1 := strings.ReplaceAll(sampleValues[i], "'", "''")
-		escapedValue2 := strings.ReplaceAll(sampleValues[i+1], "'", "''")
-		where := fmt.Sprintf("`%s` >= '%s' AND `%s` < '%s'",
-			escapeString(field), escapedValue1,
-			escapeString(field), escapedValue2)
-		query := buildSelectQuery(db, tbl, selectField, "", buildWhereCondition(conf, where), orderByClause)
-		tctx.L().Debug("created adaptive string chunk",
-			zap.String("database", db),
-			zap.String("table", tbl),
-			zap.Int("chunkIndex", chunkIndex),
-			zap.Int("totalChunks", totalChunks),
-			zap.String("condition", where))
-		
-		// Create task with performance tracking
-		task := d.newTaskTableDataWithChunker(meta, newTableData(query, selectLen, false), chunkIndex, totalChunks, chunker)
-		ctxDone := d.sendTaskToChan(tctx, task, taskChan)
-		if ctxDone {
-			return tctx.Err()
-		}
-		chunkIndex++
-	}
-
-	// Last chunk: values >= last sample
-	if len(sampleValues) > 0 {
-		escapedValue := strings.ReplaceAll(sampleValues[len(sampleValues)-1], "'", "''")
-		where := fmt.Sprintf("`%s` >= '%s'", escapeString(field), escapedValue)
-		query := buildSelectQuery(db, tbl, selectField, "", buildWhereCondition(conf, where), orderByClause)
-		tctx.L().Debug("created adaptive string chunk",
-			zap.String("database", db),
-			zap.String("table", tbl),
-			zap.Int("chunkIndex", chunkIndex),
-			zap.Int("totalChunks", totalChunks),
-			zap.String("condition", where))
-		
-		// Create task with performance tracking
-		task := d.newTaskTableDataWithChunker(meta, newTableData(query, selectLen, false), chunkIndex, totalChunks, chunker)
-		ctxDone := d.sendTaskToChan(tctx, task, taskChan)
-		if ctxDone {
-			return tctx.Err()
-		}
-	}
+	tctx.L().Info("completed incremental boundary discovery chunking",
+		zap.String("database", db),
+		zap.String("table", tbl),
+		zap.Int("totalChunks", chunkIndex))
 
 	return nil
 }
