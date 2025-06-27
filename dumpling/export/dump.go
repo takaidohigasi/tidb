@@ -1016,20 +1016,36 @@ func (d *Dumper) concurrentDumpTableByString(tctx *tcontext.Context, conn *BaseC
 		var where string
 		if err != nil || nextBoundary == "" {
 			// This is the last chunk - include all remaining rows
-			where = fmt.Sprintf("`%s` >= '%s'", escapeString(field), 
-				strings.ReplaceAll(currentBoundary, "'", "''"))
+			if chunkIndex == 0 {
+				// First chunk starting from minimum value
+				where = fmt.Sprintf("`%s` >= '%s'", escapeString(field), 
+					strings.ReplaceAll(currentBoundary, "'", "''"))
+			} else {
+				// Last chunk: exclude the previous boundary value to avoid duplication
+				where = fmt.Sprintf("`%s` > '%s'", escapeString(field), 
+					strings.ReplaceAll(currentBoundary, "'", "''"))
+			}
 			
 			tctx.L().Debug("creating final chunk", 
-				zap.String("boundary", currentBoundary))
+				zap.String("boundary", currentBoundary),
+				zap.Bool("isFirstChunk", chunkIndex == 0))
 		} else {
-			// Regular chunk: currentBoundary <= field < nextBoundary
-			where = fmt.Sprintf("`%s` >= '%s' AND `%s` < '%s'",
-				escapeString(field), strings.ReplaceAll(currentBoundary, "'", "''"),
-				escapeString(field), strings.ReplaceAll(nextBoundary, "'", "''"))
+			if chunkIndex == 0 {
+				// First chunk: include the minimum boundary value
+				where = fmt.Sprintf("`%s` >= '%s' AND `%s` < '%s'",
+					escapeString(field), strings.ReplaceAll(currentBoundary, "'", "''"),
+					escapeString(field), strings.ReplaceAll(nextBoundary, "'", "''"))
+			} else {
+				// Subsequent chunks: exclude the previous boundary value to avoid duplication
+				where = fmt.Sprintf("`%s` > '%s' AND `%s` < '%s'",
+					escapeString(field), strings.ReplaceAll(currentBoundary, "'", "''"),
+					escapeString(field), strings.ReplaceAll(nextBoundary, "'", "''"))
+			}
 			
 			tctx.L().Debug("creating incremental chunk", 
 				zap.String("start", currentBoundary),
-				zap.String("end", nextBoundary))
+				zap.String("end", nextBoundary),
+				zap.Bool("isFirstChunk", chunkIndex == 0))
 		}
 
 		query := buildSelectQuery(db, tbl, selectField, "", buildWhereCondition(conf, where), orderByClause)
