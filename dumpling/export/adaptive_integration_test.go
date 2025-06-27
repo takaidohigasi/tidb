@@ -37,24 +37,6 @@ func TestAdaptiveChunkingIntegration(t *testing.T) {
 			},
 		},
 		{
-			name:             "medium table with ID field uses optimistic strategy",
-			fieldName:        "user_id",
-			tableSize:        50000,
-			expectedStrategy: StrategyOptimistic,
-			setupMocks: func(mock sqlmock.Sqlmock) {
-				// Mock auto-increment detection
-				mock.ExpectQuery("SELECT .* ORDER BY .* LIMIT 3").WillReturnRows(
-					sqlmock.NewRows([]string{"user_id"}).
-						AddRow("1").AddRow("2").AddRow("3"))
-				
-				// Mock initial boundary query
-				mock.ExpectQuery("SELECT .* ORDER BY .* LIMIT 1").WillReturnRows(
-					sqlmock.NewRows([]string{"user_id"}).AddRow("1"))
-				
-				// No additional mock needed for optimistic numeric calculation
-			},
-		},
-		{
 			name:             "small table with complex field uses composite strategy",
 			fieldName:        "product_code",
 			tableSize:        10000,

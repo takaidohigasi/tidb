@@ -934,8 +934,6 @@ func getStrategyName(strategy ChunkStrategy) string {
 	switch strategy {
 	case StrategySequential:
 		return "sequential"
-	case StrategyOptimistic:
-		return "optimistic"
 	case StrategyComposite:
 		return "composite"
 	case StrategyMinimal:

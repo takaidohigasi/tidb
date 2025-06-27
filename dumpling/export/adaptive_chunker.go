@@ -42,10 +42,10 @@ import (
 )
 
 const (
-	// Target chunk processing time (inspired by Spirit's approach)
-	DefaultChunkTargetTime = 500 * time.Millisecond
-	MaxChunkTargetTime     = 5 * time.Second
-	MinChunkTargetTime     = 100 * time.Millisecond
+	// Target chunk processing time - set to 15s so decrease trigger is 30s
+	DefaultChunkTargetTime = 15 * time.Second
+	MaxChunkTargetTime     = 60 * time.Second
+	MinChunkTargetTime     = 1 * time.Second
 	
 	// Adaptive sizing constraints
 	DefaultStartingChunkSize = 1000
@@ -61,9 +61,8 @@ type ChunkStrategy int
 
 const (
 	StrategySequential ChunkStrategy = iota
-	StrategyOptimistic // For auto-increment or predictable keys
-	StrategyComposite  // For complex keys using actual data sampling
-	StrategyMinimal    // For very large tables with minimal sampling
+	StrategyComposite  // For complex keys using prefetching queries
+	StrategyMinimal    // For very large tables with minimal queries
 )
 
 // ChunkingMetrics tracks performance for adaptive sizing
@@ -94,10 +93,18 @@ type AdaptiveChunker struct {
 
 // NewAdaptiveChunker creates a new adaptive chunker
 func NewAdaptiveChunker(db, table, field string, conf *Config, conn *BaseConn) *AdaptiveChunker {
+	// Use user's -r parameter as starting chunk size, with reasonable bounds
+	startingChunkSize := int64(conf.Rows)
+	if startingChunkSize < 100 {
+		startingChunkSize = DefaultStartingChunkSize
+	} else if startingChunkSize > 100000 {
+		startingChunkSize = 100000
+	}
+	
 	return &AdaptiveChunker{
 		strategy:         StrategyComposite, // Default to most flexible
 		targetTime:       DefaultChunkTargetTime,
-		currentChunkSize: DefaultStartingChunkSize,
+		currentChunkSize: startingChunkSize,
 		db:               db,
 		table:            table,
 		field:            field,
@@ -109,64 +116,20 @@ func NewAdaptiveChunker(db, table, field string, conf *Config, conn *BaseConn) *
 
 // DetermineStrategy selects the best chunking strategy based on table characteristics
 func (ac *AdaptiveChunker) DetermineStrategy(tctx *tcontext.Context, count int64) ChunkStrategy {
-	// For very large tables, use minimal sampling to avoid timeouts
+	// For very large tables, use minimal queries to avoid timeouts
 	if count > LargeTableThreshold {
-		tctx.L().Info("large table detected, using minimal sampling strategy",
+		tctx.L().Info("large table detected, using minimal query strategy",
 			zap.Int64("rowCount", count),
 			zap.Int64("threshold", LargeTableThreshold))
 		return StrategyMinimal
 	}
 	
-	// Check if field looks like auto-increment (simple heuristic)
-	if ac.isLikelyAutoIncrement(tctx) {
-		tctx.L().Debug("field appears to be auto-increment, using optimistic strategy",
-			zap.String("field", ac.field))
-		return StrategyOptimistic
-	}
-	
 	// Default to composite strategy for string fields
-	tctx.L().Debug("using composite strategy for complex field",
+	tctx.L().Debug("using composite strategy for string field",
 		zap.String("field", ac.field))
 	return StrategyComposite
 }
 
-// isLikelyAutoIncrement checks if the field is likely an auto-increment column
-func (ac *AdaptiveChunker) isLikelyAutoIncrement(tctx *tcontext.Context) bool {
-	// Simple heuristic: check field name and try to determine if it's numeric
-	fieldLower := strings.ToLower(ac.field)
-	if strings.Contains(fieldLower, "id") || strings.Contains(fieldLower, "auto") {
-		// If we don't have a connection, default to optimistic for ID fields
-		if ac.conn == nil {
-			return true
-		}
-		
-		// Query a sample to see if values are numeric and sequential
-		query := fmt.Sprintf("SELECT `%s` FROM `%s`.`%s` ORDER BY `%s` LIMIT 3",
-			escapeString(ac.field), escapeString(ac.db), escapeString(ac.table), escapeString(ac.field))
-		
-		var samples []string
-		err := ac.conn.QuerySQL(tctx, func(rows *sql.Rows) error {
-			var val sql.NullString
-			if err := rows.Scan(&val); err == nil && val.Valid {
-				samples = append(samples, val.String)
-			}
-			return nil
-		}, func() {
-			samples = samples[:0]
-		}, query)
-		
-		if err == nil && len(samples) >= 2 {
-			// Simple check: if all samples are numeric, likely auto-increment
-			for _, sample := range samples {
-				if !isNumeric(sample) {
-					return false
-				}
-			}
-			return true
-		}
-	}
-	return false
-}
 
 // GetNextChunkBoundary finds the next chunk boundary using prefetching queries
 func (ac *AdaptiveChunker) GetNextChunkBoundary(tctx *tcontext.Context, previousBoundary string) (string, error) {
@@ -174,11 +137,8 @@ func (ac *AdaptiveChunker) GetNextChunkBoundary(tctx *tcontext.Context, previous
 	case StrategyMinimal:
 		// For very large tables, get minimal next boundary
 		return ac.getMinimalNextBoundary(tctx, previousBoundary)
-	case StrategyOptimistic:
-		// For auto-increment fields, calculate next boundary
-		return ac.getOptimisticNextBoundary(tctx, previousBoundary)
 	case StrategyComposite:
-		// For complex fields, use prefetching query
+		// For string fields, use prefetching query
 		return ac.getCompositeNextBoundary(tctx, previousBoundary)
 	default:
 		return "", fmt.Errorf("unknown chunking strategy: %v", ac.strategy)
@@ -239,20 +199,6 @@ func (ac *AdaptiveChunker) getCompositeNextBoundary(tctx *tcontext.Context, prev
 	return nextBoundary, err
 }
 
-// getOptimisticNextBoundary calculates next boundary for auto-increment fields
-func (ac *AdaptiveChunker) getOptimisticNextBoundary(tctx *tcontext.Context, previousBoundary string) (string, error) {
-	// For numeric auto-increment fields, calculate next boundary arithmetically
-	// instead of querying the database (optimistic assumption of no gaps)
-	if isNumeric(previousBoundary) {
-		// Simple arithmetic progression for numeric fields
-		// Convert to int, add chunk size, convert back
-		// Arithmetic progression: next_boundary = current_value + chunk_size
-		return fmt.Sprintf("%d", mustParseInt(previousBoundary)+ac.currentChunkSize), nil
-	}
-	
-	// For non-numeric fields, fall back to composite method
-	return ac.getCompositeNextBoundary(tctx, previousBoundary)
-}
 
 // getMinimalNextBoundary gets next boundary for very large tables with minimal queries
 func (ac *AdaptiveChunker) getMinimalNextBoundary(tctx *tcontext.Context, previousBoundary string) (string, error) {
@@ -288,17 +234,6 @@ func (ac *AdaptiveChunker) getMinimalNextBoundary(tctx *tcontext.Context, previo
 	return nextBoundary, err
 }
 
-// Helper function to parse integers safely
-func mustParseInt(s string) int64 {
-	// Simple integer parsing - in production this would need better error handling
-	var result int64
-	for _, char := range s {
-		if char >= '0' && char <= '9' {
-			result = result*10 + int64(char-'0')
-		}
-	}
-	return result
-}
 
 
 // RecordChunkMetrics records performance metrics for adaptive sizing
@@ -327,10 +262,10 @@ func (ac *AdaptiveChunker) adaptChunkSize(metrics ChunkingMetrics) {
 	
 	// Adjust based on processing time vs target
 	if metrics.ProcessingTime > ac.targetTime*2 {
-		// Too slow, reduce chunk size
+		// Very slow (>30s), reduce chunk size
 		ac.currentChunkSize = int64(float64(ac.currentChunkSize) * MinDynamicStepFactor)
 	} else if metrics.ProcessingTime < ac.targetTime/2 {
-		// Too fast, increase chunk size
+		// Fast (<7.5s), increase chunk size
 		ac.currentChunkSize = int64(float64(ac.currentChunkSize) * MaxDynamicStepFactor)
 	}
 	
@@ -353,15 +288,3 @@ func (ac *AdaptiveChunker) SetStrategy(strategy ChunkStrategy) {
 	ac.strategy = strategy
 }
 
-// Helper function to check if a string represents a number
-func isNumeric(s string) bool {
-	if s == "" {
-		return false
-	}
-	for _, char := range s {
-		if char < '0' || char > '9' {
-			return false
-		}
-	}
-	return true
-}

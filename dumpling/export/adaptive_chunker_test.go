@@ -38,18 +38,6 @@ func TestDetermineStrategy(t *testing.T) {
 			expectedStrategy: StrategyMinimal,
 		},
 		{
-			name:             "small table with id field uses optimistic strategy",
-			rowCount:         1000,
-			field:            "id",
-			expectedStrategy: StrategyOptimistic,
-		},
-		{
-			name:             "small table with auto_id field uses optimistic strategy",
-			rowCount:         1000,
-			field:            "auto_id",
-			expectedStrategy: StrategyOptimistic,
-		},
-		{
 			name:             "small table with string field uses composite strategy",
 			rowCount:         1000,
 			field:            "name",
@@ -59,26 +47,9 @@ func TestDetermineStrategy(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			db, mock, err := sqlmock.New()
-			require.NoError(t, err)
-			defer db.Close()
-
-			// Mock the auto-increment detection query for id fields
-			if tt.field == "id" || tt.field == "auto_id" {
-				rows := sqlmock.NewRows([]string{tt.field}).
-					AddRow("1").
-					AddRow("2").
-					AddRow("3")
-				mock.ExpectQuery("SELECT .* ORDER BY .* LIMIT 3").WillReturnRows(rows)
-			}
-
 			tctx := tcontext.Background()
-			conn, err := db.Conn(tctx)
-			require.NoError(t, err)
-			baseConn := newBaseConn(conn, false, nil)
-
 			conf := DefaultConfig()
-			chunker := NewAdaptiveChunker("test_db", "test_table", tt.field, conf, baseConn)
+			chunker := NewAdaptiveChunker("test_db", "test_table", tt.field, conf, nil)
 			
 			strategy := chunker.DetermineStrategy(tctx, tt.rowCount)
 			require.Equal(t, tt.expectedStrategy, strategy)
@@ -86,65 +57,6 @@ func TestDetermineStrategy(t *testing.T) {
 	}
 }
 
-func TestIsLikelyAutoIncrement(t *testing.T) {
-	tests := []struct {
-		name         string
-		field        string
-		sampleData   []string
-		expected     bool
-	}{
-		{
-			name:       "numeric id field",
-			field:      "id",
-			sampleData: []string{"1", "2", "3"},
-			expected:   true,
-		},
-		{
-			name:       "auto_increment field",
-			field:      "auto_id",
-			sampleData: []string{"100", "101", "102"},
-			expected:   true,
-		},
-		{
-			name:       "string id field",
-			field:      "id",
-			sampleData: []string{"abc", "def", "ghi"},
-			expected:   false,
-		},
-		{
-			name:       "non-id field",
-			field:      "name",
-			sampleData: []string{"1", "2", "3"},
-			expected:   false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			db, mock, err := sqlmock.New()
-			require.NoError(t, err)
-			defer db.Close()
-
-			// Set up mock for the sample query
-			rows := sqlmock.NewRows([]string{tt.field})
-			for _, sample := range tt.sampleData {
-				rows.AddRow(sample)
-			}
-			mock.ExpectQuery("SELECT .* ORDER BY .* LIMIT 3").WillReturnRows(rows)
-
-			tctx := tcontext.Background()
-			conn, err := db.Conn(tctx)
-			require.NoError(t, err)
-			baseConn := newBaseConn(conn, false, nil)
-
-			conf := DefaultConfig()
-			chunker := NewAdaptiveChunker("test_db", "test_table", tt.field, conf, baseConn)
-			
-			result := chunker.isLikelyAutoIncrement(tctx)
-			require.Equal(t, tt.expected, result)
-		})
-	}
-}
 
 
 func TestRecordChunkMetrics(t *testing.T) {
@@ -263,16 +175,6 @@ func TestIncrementalBoundaryDiscovery(t *testing.T) {
 			},
 		},
 		{
-			name:     "optimistic strategy",
-			strategy: StrategyOptimistic,
-			setupMocks: func(mock sqlmock.Sqlmock) {
-				// Initial boundary query
-				mock.ExpectQuery("SELECT .* ORDER BY .* LIMIT 1").WillReturnRows(
-					sqlmock.NewRows([]string{"field"}).AddRow("1"))
-				// No additional query needed for numeric optimistic
-			},
-		},
-		{
 			name:     "composite strategy",
 			strategy: StrategyComposite,
 			setupMocks: func(mock sqlmock.Sqlmock) {
@@ -310,40 +212,11 @@ func TestIncrementalBoundaryDiscovery(t *testing.T) {
 			
 			// Test getting next boundary
 			nextBoundary, err := chunker.GetNextChunkBoundary(tctx, initialBoundary)
-			if tt.strategy == StrategyOptimistic && isNumeric(initialBoundary) {
-				// Optimistic with numeric should calculate next boundary
-				require.NoError(t, err)
-				require.NotEmpty(t, nextBoundary)
-			} else {
-				// Other strategies query the database
-				require.NoError(t, err)
-			}
+			require.NoError(t, err)
 		})
 	}
 }
 
-func TestIsNumeric(t *testing.T) {
-	tests := []struct {
-		input    string
-		expected bool
-	}{
-		{"123", true},
-		{"0", true},
-		{"999999", true},
-		{"", false},
-		{"abc", false},
-		{"123abc", false},
-		{"12.34", false}, // Decimal not supported
-		{"-123", false},  // Negative not supported
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			result := isNumeric(tt.input)
-			require.Equal(t, tt.expected, result)
-		})
-	}
-}
 
 func TestChunkMetricsTracking(t *testing.T) {
 	conf := DefaultConfig()
