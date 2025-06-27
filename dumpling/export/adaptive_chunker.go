@@ -52,8 +52,6 @@ const (
 	MaxDynamicStepFactor     = 1.5
 	MinDynamicStepFactor     = 0.5
 	
-	// Large table threshold for different strategies
-	LargeTableThreshold = 100000000 // 100M rows
 )
 
 // ChunkStrategy represents different chunking approaches
@@ -61,8 +59,7 @@ type ChunkStrategy int
 
 const (
 	StrategySequential ChunkStrategy = iota
-	StrategyComposite  // For complex keys using prefetching queries
-	StrategyMinimal    // For very large tables with minimal queries
+	StrategyComposite  // For string keys using prefetching queries
 )
 
 // ChunkingMetrics tracks performance for adaptive sizing
@@ -116,34 +113,13 @@ func NewAdaptiveChunker(db, table, field string, conf *Config, conn *BaseConn) *
 
 // DetermineStrategy selects the best chunking strategy based on table characteristics
 func (ac *AdaptiveChunker) DetermineStrategy(tctx *tcontext.Context, count int64) ChunkStrategy {
-	// For very large tables, use minimal queries to avoid timeouts
-	if count > LargeTableThreshold {
-		tctx.L().Info("large table detected, using minimal query strategy",
-			zap.Int64("rowCount", count),
-			zap.Int64("threshold", LargeTableThreshold))
-		return StrategyMinimal
-	}
-	
-	// Default to composite strategy for string fields
+	// Always use composite strategy for string fields
 	tctx.L().Debug("using composite strategy for string field",
 		zap.String("field", ac.field))
 	return StrategyComposite
 }
 
 
-// GetNextChunkBoundary finds the next chunk boundary using prefetching queries
-func (ac *AdaptiveChunker) GetNextChunkBoundary(tctx *tcontext.Context, previousBoundary string) (string, error) {
-	switch ac.strategy {
-	case StrategyMinimal:
-		// For very large tables, get minimal next boundary
-		return ac.getMinimalNextBoundary(tctx, previousBoundary)
-	case StrategyComposite:
-		// For string fields, use prefetching query
-		return ac.getCompositeNextBoundary(tctx, previousBoundary)
-	default:
-		return "", fmt.Errorf("unknown chunking strategy: %v", ac.strategy)
-	}
-}
 
 // GetInitialBoundary gets the starting boundary for chunking
 func (ac *AdaptiveChunker) GetInitialBoundary(tctx *tcontext.Context) (string, error) {
@@ -170,8 +146,8 @@ func (ac *AdaptiveChunker) GetInitialBoundary(tctx *tcontext.Context) (string, e
 	return boundary, err
 }
 
-// getCompositeNextBoundary uses prefetching query to find next boundary for complex primary keys
-func (ac *AdaptiveChunker) getCompositeNextBoundary(tctx *tcontext.Context, previousBoundary string) (string, error) {
+// GetNextChunkBoundary uses prefetching query to find next boundary for string primary keys
+func (ac *AdaptiveChunker) GetNextChunkBoundary(tctx *tcontext.Context, previousBoundary string) (string, error) {
 	// Use prefetching query to find the boundary after chunk_size rows:
 	// SELECT field FROM table WHERE field > 'previousBoundary' ORDER BY field LIMIT chunk_size-1, 1
 	query := fmt.Sprintf("SELECT `%s` FROM `%s`.`%s` WHERE `%s` > '%s'", 
@@ -200,39 +176,6 @@ func (ac *AdaptiveChunker) getCompositeNextBoundary(tctx *tcontext.Context, prev
 }
 
 
-// getMinimalNextBoundary gets next boundary for very large tables with minimal queries
-func (ac *AdaptiveChunker) getMinimalNextBoundary(tctx *tcontext.Context, previousBoundary string) (string, error) {
-	// For minimal strategy, use a simple LIMIT query to avoid expensive operations
-	query := fmt.Sprintf("SELECT `%s` FROM `%s`.`%s` WHERE `%s` > '%s'", 
-		escapeString(ac.field), escapeString(ac.db), escapeString(ac.table), 
-		escapeString(ac.field), strings.ReplaceAll(previousBoundary, "'", "''"))
-	
-	if ac.conf.Where != "" {
-		query = fmt.Sprintf("%s AND %s", query, ac.conf.Where)
-	}
-	
-	// Use a smaller chunk size for minimal strategy to avoid timeouts
-	minimalChunkSize := ac.currentChunkSize / 4
-	if minimalChunkSize < 100 {
-		minimalChunkSize = 100
-	}
-	
-	query = fmt.Sprintf("%s ORDER BY `%s` LIMIT %d, 1", 
-		query, escapeString(ac.field), minimalChunkSize-1)
-	
-	var nextBoundary string
-	err := ac.conn.QuerySQL(tctx, func(rows *sql.Rows) error {
-		var val sql.NullString
-		if err := rows.Scan(&val); err == nil && val.Valid {
-			nextBoundary = val.String
-		}
-		return nil
-	}, func() {
-		nextBoundary = ""
-	}, query)
-	
-	return nextBoundary, err
-}
 
 
 

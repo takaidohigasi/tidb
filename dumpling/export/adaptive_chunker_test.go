@@ -32,15 +32,15 @@ func TestDetermineStrategy(t *testing.T) {
 		expectedStrategy ChunkStrategy
 	}{
 		{
-			name:             "large table uses minimal strategy",
-			rowCount:         LargeTableThreshold + 1000,
-			field:            "name",
-			expectedStrategy: StrategyMinimal,
-		},
-		{
-			name:             "small table with string field uses composite strategy",
+			name:             "any table with string field uses composite strategy",
 			rowCount:         1000,
 			field:            "name",
+			expectedStrategy: StrategyComposite,
+		},
+		{
+			name:             "large table also uses composite strategy",
+			rowCount:         100000000,
+			field:            "email",
 			expectedStrategy: StrategyComposite,
 		},
 	}
@@ -162,18 +162,6 @@ func TestIncrementalBoundaryDiscovery(t *testing.T) {
 		strategy     ChunkStrategy
 		setupMocks   func(sqlmock.Sqlmock)
 	}{
-		{
-			name:     "minimal strategy",
-			strategy: StrategyMinimal,
-			setupMocks: func(mock sqlmock.Sqlmock) {
-				// Initial boundary query
-				mock.ExpectQuery("SELECT .* ORDER BY .* LIMIT 1").WillReturnRows(
-					sqlmock.NewRows([]string{"field"}).AddRow("start_val"))
-				// Next boundary query
-				mock.ExpectQuery("SELECT .* WHERE .* > .* ORDER BY .* LIMIT").WillReturnRows(
-					sqlmock.NewRows([]string{"field"}).AddRow("next_val"))
-			},
-		},
 		{
 			name:     "composite strategy",
 			strategy: StrategyComposite,

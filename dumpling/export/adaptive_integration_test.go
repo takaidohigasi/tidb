@@ -22,16 +22,16 @@ func TestAdaptiveChunkingIntegration(t *testing.T) {
 		setupMocks     func(sqlmock.Sqlmock)
 	}{
 		{
-			name:             "large table with string field uses minimal strategy",
-			tableSize:        LargeTableThreshold * 2,
+			name:             "large table with string field uses composite strategy",
+			tableSize:        200000000,
 			fieldName:        "email",
-			expectedStrategy: StrategyMinimal,
+			expectedStrategy: StrategyComposite,
 			setupMocks: func(mock sqlmock.Sqlmock) {
 				// Mock initial boundary query
 				mock.ExpectQuery("SELECT .* ORDER BY .* LIMIT 1").WillReturnRows(
 					sqlmock.NewRows([]string{"email"}).AddRow("aaa@example.com"))
 				
-				// Mock next boundary query for minimal strategy
+				// Mock next boundary query for composite strategy
 				mock.ExpectQuery("SELECT .* WHERE .* > .* ORDER BY .* LIMIT").WillReturnRows(
 					sqlmock.NewRows([]string{"email"}).AddRow("zzz@example.com"))
 			},
