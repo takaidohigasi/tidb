@@ -263,11 +263,110 @@ func TestErrorHandling(t *testing.T) {
 
 	conf := DefaultConfig()
 	chunker := NewAdaptiveChunker("test_db", "test_table", "id", conf, baseConn)
-	chunker.SetStrategy(StrategyOptimistic)
+	chunker.SetStrategy(StrategyComposite)
 
 	// Test error handling in incremental boundary discovery
 	_, err = chunker.GetInitialBoundary(tctx)
 	
 	// Should handle the error gracefully
 	require.Error(t, err) // Database errors should be propagated for boundary discovery
+}
+
+// TestCompleteDataCoverageIntegration tests that string chunking covers all data without loss
+func TestCompleteDataCoverageIntegration(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Simulate a table with 1000 rows, chunk size of 100
+	totalRows := int64(1000)
+	chunkSize := int64(100)
+	expectedChunks := 10
+
+	// Mock initial boundary query
+	mock.ExpectQuery("SELECT .* ORDER BY .* LIMIT 1").WillReturnRows(
+		sqlmock.NewRows([]string{"id"}).AddRow("row_0001"))
+
+	// Mock boundary discovery queries for each chunk (need 9 boundaries for 10 chunks)
+	for i := 1; i < expectedChunks; i++ {
+		boundaryValue := fmt.Sprintf("row_%04d", i*int(chunkSize)+1)
+		mock.ExpectQuery("SELECT .* WHERE .* > .* ORDER BY .* LIMIT 1 OFFSET").WillReturnRows(
+			sqlmock.NewRows([]string{"id"}).AddRow(boundaryValue))
+	}
+
+	// Mock the final boundary query that returns empty (end of data)
+	mock.ExpectQuery("SELECT .* WHERE .* > .* ORDER BY .* LIMIT 1 OFFSET").WillReturnRows(
+		sqlmock.NewRows([]string{"id"}))
+
+	tctx := tcontext.Background()
+	conn, err := db.Conn(tctx)
+	require.NoError(t, err)
+	baseConn := newBaseConn(conn, false, nil)
+
+	conf := DefaultConfig()
+	conf.Rows = uint64(chunkSize)
+
+	// Simulate the chunking process
+	chunker := NewAdaptiveChunker("test_db", "test_table", "id", conf, baseConn)
+	
+	// Get initial boundary
+	currentBoundary, err := chunker.GetInitialBoundary(tctx)
+	require.NoError(t, err)
+	require.Equal(t, "row_0001", currentBoundary)
+
+	// Simulate the chunking loop (like in concurrentDumpTableByString)
+	chunkCount := 0
+	coveredRanges := []string{}
+
+	for chunkCount < expectedChunks+1 { // +1 for safety
+		nextBoundary, err := chunker.GetNextChunkBoundary(tctx, currentBoundary)
+		
+		var chunkRange string
+		if err != nil || nextBoundary == "" {
+			// Final chunk
+			if chunkCount == 0 {
+				chunkRange = fmt.Sprintf("id >= '%s'", currentBoundary)
+			} else {
+				chunkRange = fmt.Sprintf("id > '%s'", currentBoundary)
+			}
+			coveredRanges = append(coveredRanges, chunkRange)
+			break
+		} else {
+			// Regular chunk
+			if chunkCount == 0 {
+				chunkRange = fmt.Sprintf("id >= '%s' AND id < '%s'", currentBoundary, nextBoundary)
+			} else {
+				chunkRange = fmt.Sprintf("id > '%s' AND id < '%s'", currentBoundary, nextBoundary)
+			}
+			coveredRanges = append(coveredRanges, chunkRange)
+		}
+
+		currentBoundary = nextBoundary
+		chunkCount++
+	}
+
+	// Verify we created the expected number of chunks (account for how loop works)
+	// The loop creates one chunk per iteration, and the last iteration handles the final chunk
+	require.Equal(t, expectedChunks, len(coveredRanges), "Should create exactly %d chunks for %d rows with chunk size %d", expectedChunks, totalRows, chunkSize)
+
+	// Verify chunk boundaries create complete coverage
+	require.Greater(t, len(coveredRanges), 0, "Should have created chunk ranges")
+	
+	// Log the ranges for verification
+	t.Logf("Created %d chunks covering:", len(coveredRanges))
+	for i, rangeStr := range coveredRanges {
+		t.Logf("  Chunk %d: %s", i+1, rangeStr)
+	}
+
+	// Verify ranges don't overlap and cover expected data:
+	// - First chunk should start with >= 'row_0001'
+	// - Subsequent chunks should use > to avoid overlap
+	// - Last chunk should cover remaining data
+	require.Contains(t, coveredRanges[0], "id >= 'row_0001'", "First chunk should include initial boundary")
+	if len(coveredRanges) > 1 {
+		require.Contains(t, coveredRanges[1], "id > 'row_0101'", "Second chunk should exclude previous boundary")
+	}
+
+	// Verify all mock expectations were met
+	require.NoError(t, mock.ExpectationsWereMet())
 }

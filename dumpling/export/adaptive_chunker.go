@@ -158,7 +158,7 @@ func (ac *AdaptiveChunker) GetNextChunkBoundary(tctx *tcontext.Context, previous
 		query = fmt.Sprintf("%s AND %s", query, ac.conf.Where)
 	}
 	
-	query = fmt.Sprintf("%s ORDER BY `%s` LIMIT %d, 1", 
+	query = fmt.Sprintf("%s ORDER BY `%s` LIMIT 1 OFFSET %d", 
 		query, escapeString(ac.field), ac.currentChunkSize-1)
 	
 	var nextBoundary string
