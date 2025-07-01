@@ -620,7 +620,19 @@ func (d *Dumper) dumpTableData(tctx *tcontext.Context, conn *BaseConn, meta Tabl
 
 	// Update total rows
 	fieldName, _ := pickupPossibleField(tctx, meta, conn)
-	c := estimateCount(tctx, meta.DatabaseName(), meta.TableName(), conn, fieldName, conf)
+	
+	// For row estimation, use actual column name instead of composite key marker
+	estimationField := fieldName
+	if strings.HasPrefix(fieldName, "__COMPOSITE_PK__") {
+		// Extract first column name from composite key for estimation
+		fieldsStr := strings.TrimPrefix(fieldName, "__COMPOSITE_PK__")
+		fields := strings.Split(fieldsStr, ",")
+		if len(fields) > 0 {
+			estimationField = fields[0]
+		}
+	}
+	
+	c := estimateCount(tctx, meta.DatabaseName(), meta.TableName(), conn, estimationField, conf)
 	AddCounter(d.metrics.estimateTotalRowsCounter, float64(c))
 
 	if conf.Rows == UnspecifiedSize {
@@ -759,7 +771,18 @@ func (d *Dumper) concurrentDumpTable(tctx *tcontext.Context, conn *BaseConn, met
 		return d.dumpWholeTableDirectly(tctx, meta, taskChan, "", orderByClause, 0, 1)
 	}
 
-	count := estimateCount(d.tctx, db, tbl, conn, field, conf)
+	// For row estimation, use actual column name instead of composite key marker
+	estimationField := field
+	if strings.HasPrefix(field, "__COMPOSITE_PK__") {
+		// Extract first column name from composite key for estimation
+		fieldsStr := strings.TrimPrefix(field, "__COMPOSITE_PK__")
+		fields := strings.Split(fieldsStr, ",")
+		if len(fields) > 0 {
+			estimationField = fields[0]
+		}
+	}
+
+	count := estimateCount(d.tctx, db, tbl, conn, estimationField, conf)
 	tctx.L().Info("get estimated rows count",
 		zap.String("database", db),
 		zap.String("table", tbl),
