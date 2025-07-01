@@ -968,35 +968,17 @@ func (d *Dumper) concurrentDumpTableByString(tctx *tcontext.Context, conn *BaseC
 	db, tbl := meta.DatabaseName(), meta.TableName()
 	conf := d.conf
 
-	// For row estimation, use actual column name instead of composite key marker
-	estimationField := field
-	if strings.HasPrefix(field, "__COMPOSITE_PK__") {
-		// Extract first column name from composite key for estimation
-		fieldsStr := strings.TrimPrefix(field, "__COMPOSITE_PK__")
-		fields := strings.Split(fieldsStr, ",")
-		if len(fields) > 0 {
-			estimationField = fields[0]
-		}
-	}
-	
-	count := estimateCount(d.tctx, db, tbl, conn, estimationField, conf)
-	tctx.L().Info("get estimated rows count for adaptive string chunking",
+	// Spirit-inspired approach: Skip row estimation entirely for string chunking
+	// Use dynamic chunk discovery with processing time feedback instead
+	tctx.L().Info("using Spirit-inspired dynamic chunking without row estimation",
 		zap.String("database", db),
 		zap.String("table", tbl),
 		zap.String("field", field),
-		zap.Uint64("estimateCount", count))
-
-	// For string chunking, always try parallel processing regardless of estimated count
-	// String estimation is often inaccurate, so we'll attempt chunking even for small estimates
-	// If the table is actually small, adaptive chunking will create appropriate chunk sizes
-	tctx.L().Info("proceeding with string parallel chunking regardless of estimated count",
-		zap.String("reason", "string count estimation is often inaccurate"),
-		zap.Uint64("estimatedCount", count),
-		zap.Uint64("configRows", conf.Rows))
+		zap.String("approach", "incremental boundary discovery"))
 
 	// Create adaptive chunker with Spirit-inspired strategies
 	chunker := NewAdaptiveChunker(db, tbl, field, conf, conn)
-	strategy := chunker.DetermineStrategy(tctx, int64(count))
+	strategy := chunker.DetermineStrategy(tctx, -1) // -1 indicates unknown count (Spirit approach)
 	chunker.SetStrategy(strategy)
 
 	tctx.L().Info("selected chunking strategy",
@@ -1031,7 +1013,6 @@ func (d *Dumper) concurrentDumpTableByString(tctx *tcontext.Context, conn *BaseC
 		zap.String("table", tbl),
 		zap.String("field", field),
 		zap.String("initialBoundary", initialBoundary),
-		zap.Uint64("estimatedRows", count),
 		zap.Int64("adaptiveChunkSize", chunker.GetCurrentChunkSize()))
 
 	selectField, selectLen := meta.SelectedField(), meta.SelectedLen()
@@ -1040,25 +1021,16 @@ func (d *Dumper) concurrentDumpTableByString(tctx *tcontext.Context, conn *BaseC
 	// Incremental chunking: generate chunks dynamically using prefetching queries
 	chunkIndex := 0
 	currentBoundary := initialBoundary
-	// Calculate max chunks with fallback for poor estimates
-	var maxChunks int
-	if count > 0 {
-		maxChunks = int(int64(count)/chunker.GetCurrentChunkSize()) + 10
-	} else {
-		// If count estimation failed or returned 0, use a reasonable default
-		maxChunks = 50 // Allow up to 50 chunks for unknown table sizes
-	}
 	
-	// Ensure minimum reasonable number of chunks for potential parallelization
-	if maxChunks < 10 {
-		maxChunks = 10
-	}
+	// Spirit approach: No pre-calculated maxChunks, generate chunks until data exhausted
+	// Set a reasonable safety limit to prevent infinite loops, but allow dynamic discovery
+	const maxChunksLimit = 1000 // Safety limit to prevent runaway chunking
 	
-	tctx.L().Info("calculated chunking parameters",
-		zap.Int("maxChunks", maxChunks),
-		zap.Int64("chunkSize", chunker.GetCurrentChunkSize()))
+	tctx.L().Info("starting dynamic chunk discovery",
+		zap.Int("maxChunksLimit", maxChunksLimit),
+		zap.Int64("initialChunkSize", chunker.GetCurrentChunkSize()))
 
-	for chunkIndex < maxChunks {
+	for chunkIndex < maxChunksLimit {
 		// Get next boundary using prefetching query: SELECT field FROM table WHERE field > current ORDER BY field LIMIT chunk_size-1, 1
 		nextBoundary, err := chunker.GetNextChunkBoundary(tctx, currentBoundary)
 		
@@ -1081,8 +1053,8 @@ func (d *Dumper) concurrentDumpTableByString(tctx *tcontext.Context, conn *BaseC
 
 		query := buildSelectQuery(db, tbl, selectField, "", buildWhereCondition(conf, where), orderByClause)
 		
-		// Create task with performance tracking - note: totalChunks is estimated
-		estimatedTotalChunks := maxChunks
+		// Create task with performance tracking - note: totalChunks is unknown in Spirit approach
+		estimatedTotalChunks := -1 // -1 indicates unknown total chunks (Spirit dynamic discovery)
 		task := d.newTaskTableDataWithChunker(meta, newTableData(query, selectLen, false), chunkIndex, estimatedTotalChunks, chunker)
 		
 		ctxDone := d.sendTaskToChan(tctx, task, taskChan)
