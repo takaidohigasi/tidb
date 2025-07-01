@@ -42,10 +42,10 @@ import (
 )
 
 const (
-	// Target chunk processing time - set to 15s so decrease trigger is 30s
-	DefaultChunkTargetTime = 15 * time.Second
-	MaxChunkTargetTime     = 60 * time.Second
-	MinChunkTargetTime     = 1 * time.Second
+	// Target chunk processing time (inspired by Spirit's approach)
+	DefaultChunkTargetTime = 500 * time.Millisecond
+	MaxChunkTargetTime     = 5 * time.Second
+	MinChunkTargetTime     = 100 * time.Millisecond
 	
 	// Adaptive sizing constraints
 	DefaultStartingChunkSize = 1000
@@ -80,6 +80,8 @@ type AdaptiveChunker struct {
 	db             string
 	table          string
 	field          string
+	fields         []string // For composite keys
+	isComposite    bool     // True if this is a composite primary key
 	conf           *Config
 	conn           *BaseConn
 	
@@ -98,6 +100,18 @@ func NewAdaptiveChunker(db, table, field string, conf *Config, conn *BaseConn) *
 		startingChunkSize = 100000
 	}
 	
+	// Check if this is a composite primary key
+	isComposite := false
+	var fields []string
+	if strings.HasPrefix(field, "__COMPOSITE_PK__") {
+		isComposite = true
+		fieldsStr := strings.TrimPrefix(field, "__COMPOSITE_PK__")
+		fields = strings.Split(fieldsStr, ",")
+		field = fields[0] // Use first column for boundary discovery
+	} else {
+		fields = []string{field}
+	}
+	
 	return &AdaptiveChunker{
 		strategy:         StrategyComposite, // Default to most flexible
 		targetTime:       DefaultChunkTargetTime,
@@ -105,6 +119,8 @@ func NewAdaptiveChunker(db, table, field string, conf *Config, conn *BaseConn) *
 		db:               db,
 		table:            table,
 		field:            field,
+		fields:           fields,
+		isComposite:      isComposite,
 		conf:             conf,
 		conn:             conn,
 		metrics:          make([]ChunkingMetrics, 0),
@@ -113,9 +129,14 @@ func NewAdaptiveChunker(db, table, field string, conf *Config, conn *BaseConn) *
 
 // DetermineStrategy selects the best chunking strategy based on table characteristics
 func (ac *AdaptiveChunker) DetermineStrategy(tctx *tcontext.Context, count int64) ChunkStrategy {
-	// Always use composite strategy for string fields
-	tctx.L().Debug("using composite strategy for string field",
-		zap.String("field", ac.field))
+	// Always use composite strategy for string fields and composite keys
+	if ac.isComposite {
+		tctx.L().Debug("using composite strategy for composite primary key",
+			zap.Strings("fields", ac.fields))
+	} else {
+		tctx.L().Debug("using composite strategy for single field",
+			zap.String("field", ac.field))
+	}
 	return StrategyComposite
 }
 
@@ -123,6 +144,10 @@ func (ac *AdaptiveChunker) DetermineStrategy(tctx *tcontext.Context, count int64
 
 // GetInitialBoundary gets the starting boundary for chunking
 func (ac *AdaptiveChunker) GetInitialBoundary(tctx *tcontext.Context) (string, error) {
+	if ac.isComposite {
+		return ac.getInitialCompositeKeyBoundary(tctx)
+	}
+	
 	query := fmt.Sprintf("SELECT `%s` FROM `%s`.`%s`", 
 		escapeString(ac.field), escapeString(ac.db), escapeString(ac.table))
 	
@@ -148,8 +173,12 @@ func (ac *AdaptiveChunker) GetInitialBoundary(tctx *tcontext.Context) (string, e
 
 // GetNextChunkBoundary uses prefetching query to find next boundary for string primary keys
 func (ac *AdaptiveChunker) GetNextChunkBoundary(tctx *tcontext.Context, previousBoundary string) (string, error) {
+	if ac.isComposite {
+		return ac.getNextCompositeKeyBoundary(tctx, previousBoundary)
+	}
+	
 	// Use prefetching query to find the boundary after chunk_size rows:
-	// SELECT field FROM table WHERE field > 'previousBoundary' ORDER BY field LIMIT chunk_size-1, 1
+	// SELECT field FROM table WHERE field > 'previousBoundary' ORDER BY field LIMIT 1 OFFSET chunk_size-1
 	query := fmt.Sprintf("SELECT `%s` FROM `%s`.`%s` WHERE `%s` > '%s'", 
 		escapeString(ac.field), escapeString(ac.db), escapeString(ac.table), 
 		escapeString(ac.field), strings.ReplaceAll(previousBoundary, "'", "''"))
@@ -205,10 +234,10 @@ func (ac *AdaptiveChunker) adaptChunkSize(metrics ChunkingMetrics) {
 	
 	// Adjust based on processing time vs target
 	if metrics.ProcessingTime > ac.targetTime*2 {
-		// Very slow (>30s), reduce chunk size
+		// Very slow (>1s), reduce chunk size
 		ac.currentChunkSize = int64(float64(ac.currentChunkSize) * MinDynamicStepFactor)
 	} else if metrics.ProcessingTime < ac.targetTime/2 {
-		// Fast (<7.5s), increase chunk size
+		// Fast (<250ms), increase chunk size
 		ac.currentChunkSize = int64(float64(ac.currentChunkSize) * MaxDynamicStepFactor)
 	}
 	
@@ -229,5 +258,136 @@ func (ac *AdaptiveChunker) GetCurrentChunkSize() int64 {
 // SetStrategy sets the chunking strategy
 func (ac *AdaptiveChunker) SetStrategy(strategy ChunkStrategy) {
 	ac.strategy = strategy
+}
+
+// getInitialCompositeKeyBoundary gets the starting boundary for composite primary key chunking
+func (ac *AdaptiveChunker) getInitialCompositeKeyBoundary(tctx *tcontext.Context) (string, error) {
+	// Build SELECT clause for all primary key columns
+	selectCols := make([]string, len(ac.fields))
+	for i, field := range ac.fields {
+		selectCols[i] = fmt.Sprintf("`%s`", escapeString(field))
+	}
+	
+	query := fmt.Sprintf("SELECT %s FROM `%s`.`%s`", 
+		strings.Join(selectCols, ", "), escapeString(ac.db), escapeString(ac.table))
+	
+	if ac.conf.Where != "" {
+		query = fmt.Sprintf("%s WHERE %s", query, ac.conf.Where)
+	}
+	
+	// Build ORDER BY clause for all primary key columns
+	orderCols := make([]string, len(ac.fields))
+	for i, field := range ac.fields {
+		orderCols[i] = fmt.Sprintf("`%s`", escapeString(field))
+	}
+	query = fmt.Sprintf("%s ORDER BY %s LIMIT 1", query, strings.Join(orderCols, ", "))
+	
+	var boundary string
+	err := ac.conn.QuerySQL(tctx, func(rows *sql.Rows) error {
+		// Scan all columns
+		values := make([]sql.NullString, len(ac.fields))
+		scanArgs := make([]interface{}, len(ac.fields))
+		for i := range values {
+			scanArgs[i] = &values[i]
+		}
+		
+		if err := rows.Scan(scanArgs...); err == nil {
+			// Build composite boundary string: "val1,val2,val3"
+			boundaryParts := make([]string, len(ac.fields))
+			for i, val := range values {
+				if val.Valid {
+					boundaryParts[i] = val.String
+				} else {
+					boundaryParts[i] = ""
+				}
+			}
+			boundary = strings.Join(boundaryParts, ",")
+		}
+		return nil
+	}, func() {
+		boundary = ""
+	}, query)
+	
+	return boundary, err
+}
+
+// getNextCompositeKeyBoundary gets next boundary for composite primary key chunking
+func (ac *AdaptiveChunker) getNextCompositeKeyBoundary(tctx *tcontext.Context, previousBoundary string) (string, error) {
+	// Parse previous boundary: "val1,val2,val3"
+	prevValues := strings.Split(previousBoundary, ",")
+	if len(prevValues) != len(ac.fields) {
+		return "", fmt.Errorf("boundary values count %d doesn't match fields count %d", len(prevValues), len(ac.fields))
+	}
+	
+	// Build SELECT clause for all primary key columns
+	selectCols := make([]string, len(ac.fields))
+	for i, field := range ac.fields {
+		selectCols[i] = fmt.Sprintf("`%s`", escapeString(field))
+	}
+	
+	query := fmt.Sprintf("SELECT %s FROM `%s`.`%s`", 
+		strings.Join(selectCols, ", "), escapeString(ac.db), escapeString(ac.table))
+	
+	// Build composite WHERE clause: (col1, col2, col3) > ('val1', 'val2', 'val3')
+	whereValues := make([]string, len(prevValues))
+	for i, val := range prevValues {
+		whereValues[i] = fmt.Sprintf("'%s'", strings.ReplaceAll(val, "'", "''"))
+	}
+	
+	whereClause := fmt.Sprintf("(%s) > (%s)", 
+		strings.Join(selectCols, ", "), 
+		strings.Join(whereValues, ", "))
+	
+	if ac.conf.Where != "" {
+		whereClause = fmt.Sprintf("(%s) AND %s", whereClause, ac.conf.Where)
+	}
+	
+	query = fmt.Sprintf("%s WHERE %s", query, whereClause)
+	
+	// Build ORDER BY clause for all primary key columns
+	orderCols := make([]string, len(ac.fields))
+	for i, field := range ac.fields {
+		orderCols[i] = fmt.Sprintf("`%s`", escapeString(field))
+	}
+	query = fmt.Sprintf("%s ORDER BY %s LIMIT 1 OFFSET %d", 
+		query, strings.Join(orderCols, ", "), ac.currentChunkSize-1)
+	
+	var nextBoundary string
+	err := ac.conn.QuerySQL(tctx, func(rows *sql.Rows) error {
+		// Scan all columns
+		values := make([]sql.NullString, len(ac.fields))
+		scanArgs := make([]interface{}, len(ac.fields))
+		for i := range values {
+			scanArgs[i] = &values[i]
+		}
+		
+		if err := rows.Scan(scanArgs...); err == nil {
+			// Build composite boundary string: "val1,val2,val3"
+			boundaryParts := make([]string, len(ac.fields))
+			for i, val := range values {
+				if val.Valid {
+					boundaryParts[i] = val.String
+				} else {
+					boundaryParts[i] = ""
+				}
+			}
+			nextBoundary = strings.Join(boundaryParts, ",")
+		}
+		return nil
+	}, func() {
+		nextBoundary = ""
+	}, query)
+	
+	return nextBoundary, err
+}
+
+// GetFields returns all fields for composite keys
+func (ac *AdaptiveChunker) GetFields() []string {
+	return ac.fields
+}
+
+// IsComposite returns true if this chunker handles composite keys
+func (ac *AdaptiveChunker) IsComposite() bool {
+	return ac.isComposite
 }
 

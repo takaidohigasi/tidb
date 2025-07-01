@@ -1016,31 +1016,13 @@ func (d *Dumper) concurrentDumpTableByString(tctx *tcontext.Context, conn *BaseC
 		var where string
 		if err != nil || nextBoundary == "" {
 			// This is the last chunk - include all remaining rows
-			if chunkIndex == 0 {
-				// First chunk starting from minimum value
-				where = fmt.Sprintf("`%s` >= '%s'", escapeString(field), 
-					strings.ReplaceAll(currentBoundary, "'", "''"))
-			} else {
-				// Last chunk: exclude the previous boundary value to avoid duplication
-				where = fmt.Sprintf("`%s` > '%s'", escapeString(field), 
-					strings.ReplaceAll(currentBoundary, "'", "''"))
-			}
+			where = d.buildFinalChunkWhereClause(chunker, currentBoundary, chunkIndex == 0)
 			
 			tctx.L().Debug("creating final chunk", 
 				zap.String("boundary", currentBoundary),
 				zap.Bool("isFirstChunk", chunkIndex == 0))
 		} else {
-			if chunkIndex == 0 {
-				// First chunk: include the minimum boundary value
-				where = fmt.Sprintf("`%s` >= '%s' AND `%s` < '%s'",
-					escapeString(field), strings.ReplaceAll(currentBoundary, "'", "''"),
-					escapeString(field), strings.ReplaceAll(nextBoundary, "'", "''"))
-			} else {
-				// Subsequent chunks: exclude the previous boundary value to avoid duplication
-				where = fmt.Sprintf("`%s` > '%s' AND `%s` < '%s'",
-					escapeString(field), strings.ReplaceAll(currentBoundary, "'", "''"),
-					escapeString(field), strings.ReplaceAll(nextBoundary, "'", "''"))
-			}
+			where = d.buildIncrementalChunkWhereClause(chunker, currentBoundary, nextBoundary, chunkIndex == 0)
 			
 			tctx.L().Debug("creating incremental chunk", 
 				zap.String("start", currentBoundary),
@@ -1174,6 +1156,124 @@ func (d *Dumper) sendConcurrentDumpTiDBTasks(tctx *tcontext.Context,
 // L returns real logger
 func (d *Dumper) L() log.Logger {
 	return d.tctx.L()
+}
+
+// buildFinalChunkWhereClause builds WHERE clause for the final chunk (handles both single and composite keys)
+func (d *Dumper) buildFinalChunkWhereClause(chunker *AdaptiveChunker, currentBoundary string, isFirstChunk bool) string {
+	if chunker.IsComposite() {
+		return d.buildCompositeKeyFinalWhere(chunker, currentBoundary, isFirstChunk)
+	}
+	
+	// Single column logic
+	field := chunker.field
+	if isFirstChunk {
+		// First chunk starting from minimum value
+		return fmt.Sprintf("`%s` >= '%s'", escapeString(field), 
+			strings.ReplaceAll(currentBoundary, "'", "''"))
+	} else {
+		// Last chunk: include the boundary value to prevent data loss
+		// Changed from > to >= to ensure no gaps between chunks
+		return fmt.Sprintf("`%s` >= '%s'", escapeString(field), 
+			strings.ReplaceAll(currentBoundary, "'", "''"))
+	}
+}
+
+// buildIncrementalChunkWhereClause builds WHERE clause for incremental chunks (handles both single and composite keys)
+func (d *Dumper) buildIncrementalChunkWhereClause(chunker *AdaptiveChunker, currentBoundary, nextBoundary string, isFirstChunk bool) string {
+	if chunker.IsComposite() {
+		return d.buildCompositeKeyIncrementalWhere(chunker, currentBoundary, nextBoundary, isFirstChunk)
+	}
+	
+	// Single column logic
+	field := chunker.field
+	if isFirstChunk {
+		// First chunk: include the minimum boundary value
+		return fmt.Sprintf("`%s` >= '%s' AND `%s` < '%s'",
+			escapeString(field), strings.ReplaceAll(currentBoundary, "'", "''"),
+			escapeString(field), strings.ReplaceAll(nextBoundary, "'", "''"))
+	} else {
+		// Subsequent chunks: include the boundary value to prevent data loss
+		// Changed from > to >= to ensure no gaps between chunks
+		return fmt.Sprintf("`%s` >= '%s' AND `%s` < '%s'",
+			escapeString(field), strings.ReplaceAll(currentBoundary, "'", "''"),
+			escapeString(field), strings.ReplaceAll(nextBoundary, "'", "''"))
+	}
+}
+
+// buildCompositeKeyFinalWhere builds WHERE clause for final chunk with composite primary key
+func (d *Dumper) buildCompositeKeyFinalWhere(chunker *AdaptiveChunker, currentBoundary string, isFirstChunk bool) string {
+	fields := chunker.GetFields()
+	boundaryValues := strings.Split(currentBoundary, ",")
+	
+	if len(boundaryValues) != len(fields) {
+		// Fallback to single field if parsing fails
+		return d.buildFinalChunkWhereClause(&AdaptiveChunker{field: fields[0], isComposite: false}, boundaryValues[0], isFirstChunk)
+	}
+	
+	// Build column list: (`col1`, `col2`, `col3`)
+	quotedCols := make([]string, len(fields))
+	for i, field := range fields {
+		quotedCols[i] = fmt.Sprintf("`%s`", escapeString(field))
+	}
+	colList := fmt.Sprintf("(%s)", strings.Join(quotedCols, ", "))
+	
+	// Build value list: ('val1', 'val2', 'val3')
+	quotedValues := make([]string, len(boundaryValues))
+	for i, val := range boundaryValues {
+		quotedValues[i] = fmt.Sprintf("'%s'", strings.ReplaceAll(val, "'", "''"))
+	}
+	valueList := fmt.Sprintf("(%s)", strings.Join(quotedValues, ", "))
+	
+	if isFirstChunk {
+		// First chunk: include the minimum boundary value
+		return fmt.Sprintf("%s >= %s", colList, valueList)
+	} else {
+		// Last chunk: include the boundary value to prevent data loss
+		// Changed from > to >= to ensure no gaps between chunks
+		return fmt.Sprintf("%s >= %s", colList, valueList)
+	}
+}
+
+// buildCompositeKeyIncrementalWhere builds WHERE clause for incremental chunk with composite primary key
+func (d *Dumper) buildCompositeKeyIncrementalWhere(chunker *AdaptiveChunker, currentBoundary, nextBoundary string, isFirstChunk bool) string {
+	fields := chunker.GetFields()
+	currentValues := strings.Split(currentBoundary, ",")
+	nextValues := strings.Split(nextBoundary, ",")
+	
+	if len(currentValues) != len(fields) || len(nextValues) != len(fields) {
+		// Fallback to single field if parsing fails
+		return d.buildIncrementalChunkWhereClause(&AdaptiveChunker{field: fields[0], isComposite: false}, currentValues[0], nextValues[0], isFirstChunk)
+	}
+	
+	// Build column list: (`col1`, `col2`, `col3`)
+	quotedCols := make([]string, len(fields))
+	for i, field := range fields {
+		quotedCols[i] = fmt.Sprintf("`%s`", escapeString(field))
+	}
+	colList := fmt.Sprintf("(%s)", strings.Join(quotedCols, ", "))
+	
+	// Build current value list: ('val1', 'val2', 'val3')
+	quotedCurrentValues := make([]string, len(currentValues))
+	for i, val := range currentValues {
+		quotedCurrentValues[i] = fmt.Sprintf("'%s'", strings.ReplaceAll(val, "'", "''"))
+	}
+	currentValueList := fmt.Sprintf("(%s)", strings.Join(quotedCurrentValues, ", "))
+	
+	// Build next value list: ('val1', 'val2', 'val3')
+	quotedNextValues := make([]string, len(nextValues))
+	for i, val := range nextValues {
+		quotedNextValues[i] = fmt.Sprintf("'%s'", strings.ReplaceAll(val, "'", "''"))
+	}
+	nextValueList := fmt.Sprintf("(%s)", strings.Join(quotedNextValues, ", "))
+	
+	if isFirstChunk {
+		// First chunk: include the minimum boundary value
+		return fmt.Sprintf("%s >= %s AND %s < %s", colList, currentValueList, colList, nextValueList)
+	} else {
+		// Subsequent chunks: include the boundary value to prevent data loss
+		// Changed from > to >= to ensure no gaps between chunks
+		return fmt.Sprintf("%s >= %s AND %s < %s", colList, currentValueList, colList, nextValueList)
+	}
 }
 
 func selectTiDBTableSample(tctx *tcontext.Context, conn *BaseConn, meta TableMeta) (pkFields []string, pkVals [][]string, err error) {

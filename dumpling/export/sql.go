@@ -654,7 +654,7 @@ func GetPrimaryKeyColumns(tctx *tcontext.Context, db *BaseConn, database, table 
 
 // getPossibleIndexColumn picks up indices according to the following priority:
 // primary key > unique key with the smallest count > key with the max cardinality
-// primary key with multi cols is before unique key with single col because we will sort result by primary keys
+// For composite primary keys, returns all columns to enable proper chunking
 // Now supports both numeric and string types for parallel processing
 func getPossibleIndexColumn(tctx *tcontext.Context, db *BaseConn, meta TableMeta) (string, error) {
 	database, table := meta.DatabaseName(), meta.TableName()
@@ -672,12 +672,27 @@ func getPossibleIndexColumn(tctx *tcontext.Context, db *BaseConn, meta TableMeta
 		uniqueKeyMap   = map[string]keyColumnPair{} // unique key name -> key column name, unique key columns count
 		keyColumn      string
 		maxCardinality int64 = -1
+		primaryKeyCols []string // Store all primary key columns in order
 	)
 
-	// check primary key first, then unique key
+	// Collect all primary key columns first
 	for _, oneRow := range results {
 		nonUnique, seqInIndex, keyName, colName, cardinality := oneRow[0], oneRow[1], oneRow[2], oneRow[3], oneRow[4]
-		// only try pick the first column, because the second column of pk/uk in where condition will trigger a full table scan
+		
+		// Collect all primary key columns in order
+		if keyName == "PRIMARY" {
+			seqInIndexInt, err := strconv.Atoi(seqInIndex)
+			if err == nil {
+				// Ensure slice is large enough
+				for len(primaryKeyCols) < seqInIndexInt {
+					primaryKeyCols = append(primaryKeyCols, "")
+				}
+				primaryKeyCols[seqInIndexInt-1] = colName
+			}
+			continue
+		}
+		
+		// For non-primary keys, only use first column to avoid full table scan
 		if seqInIndex != "1" {
 			if pair, ok := uniqueKeyMap[keyName]; ok {
 				seqInIndexInt, err := strconv.ParseUint(seqInIndex, 10, 64)
@@ -692,8 +707,6 @@ func getPossibleIndexColumn(tctx *tcontext.Context, db *BaseConn, meta TableMeta
 		_, stringColumn := dataTypeString[colName2Type[colName]]
 		if numberColumn || stringColumn {
 			switch {
-			case keyName == "PRIMARY":
-				return colName, nil
 			case nonUnique == "0":
 				uniqueKeyMap[keyName] = keyColumnPair{colName, 1}
 			// pick index column with max cardinality when there is no unique index
@@ -706,6 +719,44 @@ func getPossibleIndexColumn(tctx *tcontext.Context, db *BaseConn, meta TableMeta
 			}
 		}
 	}
+	
+	// Handle primary key columns
+	if len(primaryKeyCols) > 0 {
+		// Remove any empty slots
+		validPrimaryCols := make([]string, 0, len(primaryKeyCols))
+		for _, col := range primaryKeyCols {
+			if col != "" {
+				validPrimaryCols = append(validPrimaryCols, col)
+			}
+		}
+		
+		if len(validPrimaryCols) > 0 {
+			// For single column primary key, return the column
+			if len(validPrimaryCols) == 1 {
+				colName := validPrimaryCols[0]
+				if _, numberColumn := dataTypeInt[colName2Type[colName]]; numberColumn {
+					tctx.L().Debug("found single numeric primary key column for chunking",
+						zap.String("column", colName),
+						zap.String("type", colName2Type[colName]))
+					return colName, nil
+				}
+				if _, stringColumn := dataTypeString[colName2Type[colName]]; stringColumn {
+					tctx.L().Debug("found single string primary key column for chunking",
+						zap.String("column", colName),
+						zap.String("type", colName2Type[colName]))
+					return colName, nil
+				}
+			} else {
+				// For composite primary key, return special indicator
+				tctx.L().Debug("found composite primary key for chunking",
+					zap.Strings("columns", validPrimaryCols))
+				// Return a special format to indicate composite key
+				return fmt.Sprintf("__COMPOSITE_PK__%s", strings.Join(validPrimaryCols, ",")), nil
+			}
+		}
+	}
+	
+	// Fall back to unique keys if no primary key found
 	if len(uniqueKeyMap) > 0 {
 		var (
 			minCols         uint64 = math.MaxUint64
