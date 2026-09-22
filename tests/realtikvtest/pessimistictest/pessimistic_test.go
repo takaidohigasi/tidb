@@ -3945,7 +3945,10 @@ func TestSelectForUpdateSkipLocked(t *testing.T) {
 	}, 5*time.Second, 100*time.Millisecond)
 	tk2.MustExec("commit")
 
-	// The queue-worker pattern: concurrent workers pop disjoint rows.
+	// The queue-worker pattern: concurrent workers all running `... LIMIT 1 FOR
+	// UPDATE SKIP LOCKED` pop disjoint rows, each locking only the row it returns
+	// (the planner keeps the Limit above the lock operator in skip-locked mode and
+	// the executor locks candidates incrementally).
 	tk1.MustExec("drop table if exists queue")
 	tk1.MustExec("create table queue (id int primary key, taken int default 0)")
 	tk1.MustExec("insert into queue values (1, 0), (2, 0), (3, 0)")
@@ -3953,13 +3956,13 @@ func TestSelectForUpdateSkipLocked(t *testing.T) {
 	tk2.MustExec("begin pessimistic")
 	tk3.MustExec("set session tidb_enable_select_skip_locked = 1")
 	tk3.MustExec("begin pessimistic")
-	r1 := tk1.MustQuery("select id from queue where taken = 0 order by id limit 1 for update skip locked").Rows()
-	require.Len(t, r1, 1)
-	r2 := tk2.MustQuery("select id from queue where taken = 0 order by id for update skip locked").Rows()
-	require.Len(t, r2, 2)
-	require.NotContains(t, r2, r1[0])
-	r3 := tk3.MustQuery("select id from queue where taken = 0 for update skip locked").Rows()
-	require.Len(t, r3, 0)
+	popStmt := "select id from queue where taken = 0 order by id limit 1 for update skip locked"
+	tk1.MustQuery(popStmt).Check(testkit.Rows("1"))
+	tk2.MustQuery(popStmt).Check(testkit.Rows("2"))
+	tk3.MustQuery(popStmt).Check(testkit.Rows("3"))
+	// All rows are taken now: a fourth pop gets an empty result without waiting.
+	tk1.MustQuery("select id from queue where taken = 0 and id > 1 order by id limit 1 for update skip locked").
+		Check(testkit.Rows())
 	tk1.MustExec("commit")
 	tk2.MustExec("commit")
 	tk3.MustExec("commit")

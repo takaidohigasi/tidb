@@ -85,6 +85,16 @@ func (p *LogicalLock) PushDownTopN(topNLogicalPlan base.LogicalPlan) base.Logica
 	if topNLogicalPlan != nil {
 		topN = topNLogicalPlan.(*LogicalTopN)
 	}
+	// In skip-locked mode the lock operator removes rows locked by other transactions
+	// from the result set, so a Limit/TopN below it would cut candidate rows before
+	// the skipping happens and the statement could return fewer rows than available
+	// (e.g. two queue workers both running `... LIMIT 1 FOR UPDATE SKIP LOCKED`, with
+	// the second one getting an empty result). Keep the TopN above the lock; when the
+	// child can supply the ordering, the physical property framework still turns it
+	// into a Limit above the lock with a keep-order scan below.
+	if topN != nil && p.Lock.LockType == ast.SelectLockForUpdateSkipLocked {
+		return pushDownTopNForBaseLogicalPlan(p, topNLogicalPlan)
+	}
 	if topN != nil {
 		p.Children()[0] = p.Children()[0].PushDownTopN(topN)
 	}

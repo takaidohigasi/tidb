@@ -306,6 +306,25 @@ func TestSelectForUpdateSkipLocked(t *testing.T) {
 	}, 3*time.Second, 100*time.Millisecond)
 	tk2.MustExec("commit")
 
+	// The queue-worker pattern: with the Limit kept above the lock operator and
+	// incremental locking, concurrent workers all running `... LIMIT 1 FOR UPDATE
+	// SKIP LOCKED` pop disjoint rows, and each locks only the row it returns.
+	tk1.MustExec("create table q (id int primary key, taken int default 0)")
+	tk1.MustExec("insert into q values (1, 0), (2, 0), (3, 0)")
+	tk3.MustExec("set session tidb_enable_select_skip_locked = 1")
+	tk1.MustExec("begin pessimistic")
+	tk2.MustExec("begin pessimistic")
+	tk3.MustExec("begin pessimistic")
+	popStmt := "select id from q where taken = 0 order by id limit 1 for update skip locked"
+	// The disjoint results also prove each worker locked only the row it returned:
+	// had worker 1 locked the whole fetched batch, workers 2 and 3 would get nothing.
+	tk1.MustQuery(popStmt).Check(testkit.Rows("1"))
+	tk2.MustQuery(popStmt).Check(testkit.Rows("2"))
+	tk3.MustQuery(popStmt).Check(testkit.Rows("3"))
+	tk1.MustExec("commit")
+	tk2.MustExec("commit")
+	tk3.MustExec("commit")
+
 	// Skip-locked composes with fair locking by exiting fair locking mode.
 	tk2.MustExec("set session tidb_pessimistic_txn_fair_locking = 1")
 	tk1.MustExec("begin pessimistic")
