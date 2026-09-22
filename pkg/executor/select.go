@@ -265,8 +265,13 @@ func (e *SelectLockExec) Open(ctx context.Context) error {
 
 // Next implements the Executor Next interface.
 func (e *SelectLockExec) Next(ctx context.Context, req *chunk.Chunk) error {
+	// GrowAndReset resets the required rows to max on its grow path, but the
+	// skip-locked path locks candidate rows in batches sized by the parent's
+	// requirement (e.g. a Limit above), so preserve it across the reset.
+	requiredRows := req.RequiredRows()
 	req.GrowAndReset(e.MaxChunkSize())
 	if len(e.tblID2Handle) > 0 && e.Lock.LockType == ast.SelectLockForUpdateSkipLocked {
+		req.SetRequiredRows(requiredRows, e.MaxChunkSize())
 		return e.nextSkipLocked(ctx, req)
 	}
 	err := exec.Next(ctx, e.Children(0), req)
